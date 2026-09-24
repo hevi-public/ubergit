@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::ResizableState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::{prelude::*, *};
 use ubergit_core::detail::{self, FileDiff, RepoDetail};
@@ -204,6 +205,20 @@ pub struct Filter {
     _subscription: Subscription,
 }
 
+/// Drag-resizable split state: the three columns, the side panels and main/command log.
+pub struct Layout {
+    pub columns: Entity<ResizableState>,
+    pub side: Entity<ResizableState>,
+    pub main: Entity<ResizableState>,
+    /// Initial column widths, from the window size at startup.
+    pub repos_width: Pixels,
+    pub side_width: Pixels,
+}
+
+/// Default share of the window width for the Repos and side columns.
+pub const REPOS_SHARE: f32 = 0.28;
+pub const SIDE_SHARE: f32 = 0.26;
+
 pub struct Workspace {
     pub store: Entity<RepoStore>,
     pub focus: FocusHandle,
@@ -219,6 +234,7 @@ pub struct Workspace {
     pub main: MainState,
     pub dialog: Option<Dialog>,
     pub spinner: usize,
+    pub layout: Layout,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -270,6 +286,16 @@ impl Workspace {
             },
             dialog: None,
             spinner: 0,
+            layout: {
+                let width = window.viewport_size().width;
+                Layout {
+                    columns: cx.new(|_| ResizableState::default()),
+                    side: cx.new(|_| ResizableState::default()),
+                    main: cx.new(|_| ResizableState::default()),
+                    repos_width: width * REPOS_SHARE,
+                    side_width: width * SIDE_SHARE,
+                }
+            },
             _subscriptions: vec![observe],
             _ticker: ticker,
         }

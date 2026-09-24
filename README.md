@@ -17,6 +17,9 @@ extra panel on the left listing the repos.
            │ [5] Stash               │ Command log
 ```
 
+Drag the gaps between panels to resize them: the three columns, the side panels below
+Status, and the main view against the command log.
+
 ## Run
 
 ```sh

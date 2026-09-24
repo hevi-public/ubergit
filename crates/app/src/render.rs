@@ -1,8 +1,10 @@
 //! Drawing: lazygit's framed panels, rows, main view, command log, bottom bar, popups.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::base::{ResizeHandleContext, ResizeHandleRenderer, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::{prelude::*, *};
 use ubergit_core::{CmdKind, FileKind, Head, RepoSummary, Upstream};
@@ -15,10 +17,29 @@ use crate::workspace::{Dialog, MainContent, Panel, ScreenMode, TextKind, View, W
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GAP: Pixels = px(10.);
-/// Fraction of the window used by the Repos column in the normal layout.
-const REPOS_WIDTH: f32 = 0.22;
+const HALF_GAP: Pixels = px(5.);
+/// Padding on each side of a column boundary; the drag handle sits in the middle.
+const COLUMN_GAP: Pixels = px(4.);
+/// Smallest a resizable panel may get: one line of content in its frame.
+const MIN_PANEL: Pixels = px(40.);
 /// Advance of one Menlo glyph at 13px.
 const CHAR_WIDTH: Pixels = px(7.83);
+
+/// Resize handles are invisible until hovered or dragged, then show as a thin line in
+/// the active border colour, so the gaps between frames look like lazygit's.
+fn handle_appearance() -> ResizeHandleRenderer {
+    Rc::new(|handle: &ResizeHandleContext, _: &mut Window, _: &mut App| {
+        let line = div()
+            .flex_none()
+            .when(handle.is_active(), |d| d.bg(Palette::active_border()))
+            .group_hover("handle", |style| style.bg(Palette::active_border()));
+        let line = match handle.axis() {
+            Axis::Horizontal => line.h_full().w(px(1.)),
+            Axis::Vertical => line.w_full().h(px(1.)),
+        };
+        Some(line.into_any_element())
+    })
+}
 
 fn frame_height(lines: usize) -> Pixels {
     LINE_HEIGHT * lines as f32 + px(10.)
@@ -81,14 +102,17 @@ impl Workspace {
                     .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body)),
             )
             .child(
-                div()
-                    .absolute()
-                    .top(px(-10.))
-                    .left(px(8.))
-                    .px(px(3.))
-                    .bg(Palette::bg())
-                    .whitespace_nowrap()
-                    .child(title.build()),
+                // Spans the top border so a long title is clipped at the frame's edge
+                // when the panel is resized narrow; only the title itself has a background.
+                div().absolute().top(px(-10.)).left(px(8.)).right(px(8.)).flex().child(
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .px(px(3.))
+                        .bg(Palette::bg())
+                        .whitespace_nowrap()
+                        .child(title.build()),
+                ),
             )
             .when_some(footer, |d, footer| {
                 d.child(
@@ -151,13 +175,22 @@ impl Workspace {
         uniform_list(
             view.context(),
             count,
-            cx.processor(move |this, range: Range<usize>, window, cx| {
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
                 let store = this.store.read(cx);
                 let visible = this.visible(view, store);
                 let cursor = this.cursor(view, visible.len());
                 let active = this.is_active(panel) || (this.focused == Panel::Main && this.last_side == panel);
-                // Leave room for branch + status after the name in the narrow Repos column.
-                let panel_chars = (window.viewport_size().width * REPOS_WIDTH / CHAR_WIDTH) as usize;
+                // Leave room for branch + status after the name in the Repos column.
+                let repos_width = this
+                    .layout
+                    .columns
+                    .read(cx)
+                    .sizes()
+                    .first()
+                    .copied()
+                    .filter(|w| *w > px(0.))
+                    .unwrap_or(this.layout.repos_width);
+                let panel_chars = (repos_width / CHAR_WIDTH) as usize;
                 let longest = store.repos.iter().map(|r| r.name().chars().count()).max().unwrap_or(0);
                 let name_width = longest.min(panel_chars.saturating_sub(20).max(10));
                 range
@@ -342,32 +375,61 @@ impl Workspace {
 
     // ---- layout ------------------------------------------------------------------------------
 
-    fn side_panel(&self, panel: Panel, fill: bool, cx: &mut Context<Self>) -> Div {
+    /// A side panel's frame, filling whatever space its container gives it.
+    fn side_panel(&self, panel: Panel, cx: &mut Context<Self>) -> Div {
         let body = self.list_body(panel, cx);
-        let frame = self.panel_frame(panel, body, cx);
-        match panel {
-            _ if fill => frame.flex_1().min_h(px(0.)),
-            Panel::Status => frame.h(frame_height(1)).flex_none(),
-            Panel::Stash if self.focused != Panel::Stash => frame.h(frame_height(1)).flex_none(),
-            _ => frame.flex_1().min_h(frame_height(1)),
-        }
+        self.panel_frame(panel, body, cx).size_full()
     }
 
+    /// Status (fixed, one line) above Files / Branches / Commits / Stash, which share
+    /// the rest and are resized by dragging the gaps between them.
     fn side_column(&self, cx: &mut Context<Self>) -> Div {
-        let mut column = div().flex().flex_col().gap(GAP).h_full();
-        for panel in [Panel::Status, Panel::Files, Panel::Branches, Panel::Commits, Panel::Stash] {
-            column = column.child(self.side_panel(panel, false, cx));
+        let panels = [Panel::Files, Panel::Branches, Panel::Commits, Panel::Stash];
+        let last = panels.len() - 1;
+        let mut items = Vec::new();
+        for (ix, panel) in panels.into_iter().enumerate() {
+            let item = resizable_panel()
+                .size_range(MIN_PANEL..Pixels::MAX)
+                .when(ix > 0, |p| p.pt(HALF_GAP))
+                .when(ix < last, |p| p.pb(HALF_GAP))
+                .child(self.side_panel(panel, cx));
+            // lazygit keeps Stash short; the others split the remaining height.
+            items.push(if panel == Panel::Stash { item.size(frame_height(3) + HALF_GAP) } else { item });
         }
-        column
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.side_panel(Panel::Status, cx).h(frame_height(1)).flex_none())
+            .child(
+                div().flex_1().min_h(px(0.)).pt(GAP).child(
+                    v_resizable("side-panels")
+                        .with_state(&self.layout.side)
+                        .with_handle_appearance(handle_appearance())
+                        .children(items),
+                ),
+            )
     }
 
+    /// Main view above the command log, split by a draggable gap.
     fn main_column(&self, cx: &mut Context<Self>) -> Div {
-        let mut column = div().flex().flex_col().gap(GAP).h_full().min_w(px(0.));
-        column = column.child(self.main_panel(cx));
-        if self.show_command_log && self.screen_mode == ScreenMode::Normal {
-            column = column.child(self.command_log(cx));
+        let main = self.main_panel(cx);
+        if !self.show_command_log || self.screen_mode != ScreenMode::Normal {
+            return div().size_full().child(main);
         }
-        column
+        div().size_full().child(
+            v_resizable("main-split")
+                .with_state(&self.layout.main)
+                .with_handle_appearance(handle_appearance())
+                .child(resizable_panel().size_range(MIN_PANEL..Pixels::MAX).pb(HALF_GAP).child(main))
+                .child(
+                    resizable_panel()
+                        .size(frame_height(8) + HALF_GAP)
+                        .size_range(MIN_PANEL..Pixels::MAX)
+                        .pt(HALF_GAP)
+                        .child(self.command_log(cx)),
+                ),
+        )
     }
 
     fn main_panel(&self, cx: &mut Context<Self>) -> Div {
@@ -377,8 +439,7 @@ impl Workspace {
                 let unstaged_title = main_title("Unstaged changes", true);
                 let staged_title = main_title("Staged changes", false);
                 div()
-                    .flex_1()
-                    .min_h(px(0.))
+                    .size_full()
                     .flex()
                     .flex_col()
                     .gap(GAP)
@@ -401,7 +462,7 @@ impl Workspace {
                     MainContent::Split { .. } => unreachable!(),
                 };
                 let title = main_title(&self.main.title, active);
-                self.frame(title, active, None, body).flex_1().min_h(px(0.))
+                self.frame(title, active, None, body).size_full()
             }
         }
     }
@@ -572,7 +633,8 @@ impl Workspace {
 
     fn command_log(&self, cx: &mut Context<Self>) -> Div {
         let store = self.store.read(cx);
-        let max = 8;
+        // Enough for a tall log; the frame clips from the top so the newest stay visible.
+        let max = 80;
         let lines: Vec<Line> = store
             .log
             .iter()
@@ -606,8 +668,15 @@ impl Workspace {
             .flex_col()
             .justify_end()
             .h_full()
-            .children(lines.into_iter().map(|l| div().h(LINE_HEIGHT).whitespace_nowrap().overflow_hidden().child(l.build())));
-        self.frame(title, false, None, body).h(frame_height(max)).flex_none()
+            .children(lines.into_iter().map(|l| {
+                div()
+                    .h(LINE_HEIGHT)
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(l.build())
+            }));
+        self.frame(title, false, None, body).size_full()
     }
 
     fn bottom_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -807,22 +876,32 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.current_view();
         let columns = match self.screen_mode {
-            ScreenMode::Normal => div()
-                .flex()
-                .flex_row()
-                .gap(px(8.))
-                .size_full()
-                .child(
-                    div()
-                        .w(relative(REPOS_WIDTH))
-                        .flex_none()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .child(self.side_panel(Panel::Repos, true, cx)),
-                )
-                .child(div().w(relative(0.26)).flex_none().h_full().child(self.side_column(cx)))
-                .child(div().flex_1().min_w(px(0.)).h_full().child(self.main_column(cx))),
+            // Repos | side panels | main, resized by dragging the gaps between columns.
+            ScreenMode::Normal => div().size_full().child(
+                h_resizable("columns")
+                    .with_state(&self.layout.columns)
+                    .with_handle_appearance(handle_appearance())
+                    .child(
+                        resizable_panel()
+                            .size(self.layout.repos_width)
+                            .size_range(px(160.)..Pixels::MAX)
+                            .pr(COLUMN_GAP)
+                            .child(self.side_panel(Panel::Repos, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(self.layout.side_width)
+                            .size_range(px(200.)..Pixels::MAX)
+                            .px(COLUMN_GAP)
+                            .child(self.side_column(cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(300.)..Pixels::MAX)
+                            .pl(COLUMN_GAP)
+                            .child(self.main_column(cx)),
+                    ),
+            ),
             ScreenMode::Half => {
                 let side = self.main_source();
                 div()
@@ -830,14 +909,14 @@ impl Render for Workspace {
                     .flex_row()
                     .gap(px(8.))
                     .size_full()
-                    .child(div().w(relative(0.4)).h_full().flex().flex_col().child(self.side_panel(side, true, cx)))
+                    .child(div().w(relative(0.4)).h_full().child(self.side_panel(side, cx)))
                     .child(div().flex_1().min_w(px(0.)).h_full().child(self.main_column(cx)))
             }
             ScreenMode::Full => {
                 let content = if self.focused == Panel::Main {
                     self.main_column(cx)
                 } else {
-                    div().h_full().flex().flex_col().child(self.side_panel(self.focused, true, cx))
+                    self.side_panel(self.focused, cx)
                 };
                 div().size_full().child(content)
             }

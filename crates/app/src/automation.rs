@@ -50,6 +50,48 @@ pub fn run(window: AnyWindowHandle, script: String, cx: &mut App) {
                         Ok(Err(err)) | Err(err) => eprintln!("screenshot failed: {err:#}"),
                     }
                 }
+                // drag x1 y1 x2 y2, in window points (half the screenshot's pixels).
+                "drag" => {
+                    let n: Vec<f32> = arg.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+                    let [x1, y1, x2, y2] = n[..] else {
+                        eprintln!("automation: drag needs x1 y1 x2 y2");
+                        continue;
+                    };
+                    let at = |x: f32, y: f32| point(px(x), px(y));
+                    let mut events = vec![
+                        PlatformInput::MouseMove(MouseMoveEvent { position: at(x1, y1), ..Default::default() }),
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: at(x1, y1),
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                    ];
+                    for step in 1..=10 {
+                        let t = step as f32 / 10.;
+                        events.push(PlatformInput::MouseMove(MouseMoveEvent {
+                            position: at(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t),
+                            pressed_button: Some(MouseButton::Left),
+                            ..Default::default()
+                        }));
+                    }
+                    events.push(PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: at(x2, y2),
+                        click_count: 1,
+                        ..Default::default()
+                    }));
+                    for event in events {
+                        window
+                            .update(cx, |_, window, cx| {
+                                window.dispatch_event(event, cx);
+                                // Let hitboxes and drag state settle between events.
+                                window.draw(cx).clear(cx);
+                            })
+                            .ok();
+                        pause(16).await;
+                    }
+                }
                 "quit" => {
                     cx.update(|cx| cx.quit());
                 }
