@@ -1,6 +1,6 @@
 //! The root view: lazygit's panels plus the Repos column, focus, selection and actions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use gpui_kit::{prelude::*, *};
 use ubergit_core::detail::{self, FileDiff, RepoDetail};
 use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstream, ops};
 
+use crate::batch::BatchRow;
 use crate::keymap::*;
 use crate::store::RepoStore;
 
@@ -50,7 +51,7 @@ impl Panel {
 
     pub fn jump_key(self) -> &'static str {
         match self {
-            Panel::Repos => "^R",
+            Panel::Repos => "⌘R",
             Panel::Status => "1",
             Panel::Files => "2",
             Panel::Branches => "3",
@@ -197,6 +198,13 @@ pub enum Dialog {
         scroll: UniformListScrollHandle,
         top: usize,
     },
+    /// Per-repo outcomes of a multi-repo action, filled in as each repo finishes.
+    Results {
+        id: u64,
+        title: SharedString,
+        rows: Vec<BatchRow>,
+        scroll: UniformListScrollHandle,
+    },
 }
 
 pub struct Filter {
@@ -235,6 +243,10 @@ pub struct Workspace {
     pub dialog: Option<Dialog>,
     pub spinner: usize,
     pub layout: Layout,
+    /// Repos marked in the Repos panel; actions started there run on all of them.
+    pub marked: HashSet<PathBuf>,
+    /// Identifies the multi-repo action whose results popup is showing.
+    pub(crate) last_batch: u64,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -296,6 +308,8 @@ impl Workspace {
                     side_width: width * SIDE_SHARE,
                 }
             },
+            marked: HashSet::new(),
+            last_batch: 0,
             _subscriptions: vec![observe],
             _ticker: ticker,
         }
@@ -458,6 +472,10 @@ impl Workspace {
     }
 
     fn on_store_changed(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        if !store.scanning {
+            self.marked.retain(|root| store.index_of(root).is_some());
+        }
         self.after_change(cx);
     }
 
@@ -729,6 +747,9 @@ impl Workspace {
             self.after_change(cx);
         } else if self.focused == Panel::Main {
             self.focus_panel(self.last_side, window, cx);
+        } else if self.focused == Panel::Repos && !self.marked.is_empty() {
+            self.marked.clear();
+            cx.notify();
         }
     }
 
@@ -857,7 +878,7 @@ impl Workspace {
                     ops::commit(&git, &loc, &message, amend).await
                 });
             }
-            Dialog::Error { .. } | Dialog::Help { .. } => {}
+            Dialog::Error { .. } | Dialog::Help { .. } | Dialog::Results { .. } => {}
         }
         cx.notify();
     }
@@ -914,7 +935,7 @@ impl Workspace {
         );
     }
 
-    fn show_message(&mut self, title: &str, message: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_message(&mut self, title: &str, message: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
         self.open_dialog(
             Dialog::Error {
                 title: title.to_string().into(),
@@ -994,6 +1015,9 @@ impl Workspace {
     // ---- remote & multi-repo actions ------------------------------------------------------
 
     pub fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(roots) = self.marked_targets(cx) {
+            return self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
+        }
         let Some(root) = self.selected_root(cx) else { return };
         let task = self.store.update(cx, |store, cx| store.fetch(&root, cx));
         cx.spawn_in(window, async move |this, cx| {
@@ -1009,10 +1033,16 @@ impl Workspace {
     }
 
     pub fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(roots) = self.marked_targets(cx) {
+            return self.pull_repos(roots, window, cx);
+        }
         self.op("Pulling", window, cx, |git, loc| async move { ops::pull(&git, &loc).await });
     }
 
     pub fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(roots) = self.marked_targets(cx) {
+            return self.push_repos(roots, window, cx);
+        }
         let Some(root) = self.selected_root(cx) else { return };
         let store = self.store.read(cx);
         let Some(summary) = store.entry(&root).and_then(|e| e.summary.clone()) else { return };
@@ -1042,40 +1072,6 @@ impl Workspace {
                 );
             } else {
                 this.show_error("Push", &err, window, cx);
-            }
-        });
-    }
-
-    pub fn fast_forward_all(&mut self, _: &FastForwardAll, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        if let Some((done, total)) = store.fetch_round {
-            return self.show_message(
-                "Fast-forward all",
-                format!("A fetch is in progress ({done}/{total}). Try again when it finishes."),
-                window,
-                cx,
-            );
-        }
-        let roots = store.fast_forward_candidates();
-        if roots.is_empty() {
-            return self.show_message(
-                "Fast-forward all",
-                "No repos to update: none are clean, on a branch, and behind their upstream.\nFetch first with F.",
-                window,
-                cx,
-            );
-        }
-        let names: Vec<String> = roots
-            .iter()
-            .filter_map(|r| store.entry(r).map(|e| e.name().to_string()))
-            .collect();
-        let repos = if roots.len() == 1 { "repo" } else { "repos" };
-        let message = format!("Fast-forward {} {repos} to their upstream?\n\n{}", roots.len(), names.join("\n"));
-        self.confirm("Fast-forward all", message, window, cx, move |this, window, cx| {
-            for root in roots {
-                this.op_on(root, "Updating", window, cx, |git, loc| async move {
-                    ops::fast_forward_head(&git, &loc).await
-                });
             }
         });
     }

@@ -1,5 +1,6 @@
 //! ubergit: lazygit-style GUI for many git repositories at once.
 
+mod batch;
 mod keymap;
 mod render;
 mod store;

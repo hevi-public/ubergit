@@ -9,6 +9,7 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::{prelude::*, *};
 use ubergit_core::{CmdKind, FileKind, Head, RepoSummary, Upstream};
 
+use crate::batch::{BatchRow, Outcome, headline};
 use crate::keymap::{self, *};
 use crate::store::{RepoEntry, RepoStore};
 use crate::text::{Line, age, truncate};
@@ -144,6 +145,9 @@ impl Workspace {
         if let Some(filter) = self.filters.get(&view).filter(|f| !f.is_empty()) {
             title.color(format!(" (filter: {filter})"), Palette::cyan());
         }
+        if panel == Panel::Repos && !self.marked.is_empty() {
+            title.color(format!(" ({} marked)", self.marked.len()), Palette::cyan());
+        }
         self.frame(title, active, footer, body)
     }
 
@@ -191,8 +195,9 @@ impl Workspace {
                     .filter(|w| *w > px(0.))
                     .unwrap_or(this.layout.repos_width);
                 let panel_chars = (repos_width / CHAR_WIDTH) as usize;
+                let reserved = if this.marked.is_empty() { 20 } else { 22 };
                 let longest = store.repos.iter().map(|r| r.name().chars().count()).max().unwrap_or(0);
-                let name_width = longest.min(panel_chars.saturating_sub(20).max(10));
+                let name_width = longest.min(panel_chars.saturating_sub(reserved).max(10));
                 range
                     .filter_map(|pos| {
                         let ix = *visible.get(pos)?;
@@ -211,7 +216,10 @@ impl Workspace {
                                 .child(line.build())
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if view == View::Repos && event.modifiers.platform {
+                                            this.toggle_mark_at(pos, cx);
+                                        }
                                         this.click_row(view, pos, panel, window, cx)
                                     }),
                                 ),
@@ -328,6 +336,11 @@ impl Workspace {
 
     fn repo_row(&self, entry: &RepoEntry, name_width: usize) -> Line {
         let mut line = Line::new();
+        let mut name_end = name_width + 3;
+        if !self.marked.is_empty() {
+            mark_column(&mut line, self.marked.contains(&entry.location.root));
+            name_end += 2;
+        }
         let (glyph, color) = if entry.busy.is_some() {
             (self.spinner(), Palette::cyan())
         } else if entry.error.is_some() {
@@ -340,7 +353,7 @@ impl Workspace {
         line.color(glyph, color);
         line.push(" ");
         line.push(truncate(entry.name(), name_width));
-        line.pad_to(name_width + 3);
+        line.pad_to(name_end);
         let Some(s) = &entry.summary else {
             if let Some(err) = &entry.error {
                 line.color(truncate(err.lines().next().unwrap_or(""), 60), Palette::red());
@@ -485,16 +498,22 @@ impl Workspace {
                 let store = this.store.read(cx);
                 let visible = this.visible(View::Repos, store);
                 let cursor = this.cursor(View::Repos, visible.len());
+                let marks = !this.marked.is_empty();
                 range
                     .map(|pos| {
-                        let line = if pos == 0 {
-                            overview_header(name_w)
-                        } else {
-                            visible
-                                .get(pos - 1)
-                                .map(|&ix| overview_row(&store.repos[ix], name_w))
-                                .unwrap_or_default()
-                        };
+                        let mut line = Line::new();
+                        if pos == 0 {
+                            if marks {
+                                line.push("  ");
+                            }
+                            line.append(overview_header(name_w));
+                        } else if let Some(&ix) = visible.get(pos - 1) {
+                            let entry = &store.repos[ix];
+                            if marks {
+                                mark_column(&mut line, this.marked.contains(&entry.location.root));
+                            }
+                            line.append(overview_row(entry, name_w));
+                        }
                         div()
                             .id(pos)
                             .h(LINE_HEIGHT)
@@ -729,7 +748,7 @@ impl Workspace {
             .child(div().text_color(Palette::green()).child(info))
     }
 
-    fn dialog_layer(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn dialog_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let dialog = self.dialog.as_ref()?;
         let (title, body, width): (String, AnyElement, Pixels) = match dialog {
             Dialog::Confirm { title, message, .. } | Dialog::Error { title, message } => {
@@ -778,6 +797,12 @@ impl Workspace {
                 self.help_body(scroll, cx),
                 px(640.),
             ),
+            Dialog::Results { title, rows, scroll, .. } => {
+                // As many rows as fit in the popup (80% of the window) beside its title,
+                // tally and hint lines; the rest scroll.
+                let max_rows = ((window.viewport_size().height * 0.8 - px(110.)) / LINE_HEIGHT).max(3.) as usize;
+                (title.to_string(), self.results_body(rows, scroll, max_rows), px(760.))
+            }
         };
         let mut title_line = Line::new();
         title_line.bold(title, Palette::active_border());
@@ -830,6 +855,73 @@ impl Workspace {
                 .bg(hsla(0., 0., 0., 0.35))
                 .child(boxed),
         )
+    }
+
+    /// One line per repo of a multi-repo action, then a tally.
+    fn results_body(&self, rows: &[BatchRow], scroll: &UniformListScrollHandle, max_rows: usize) -> AnyElement {
+        let name_w = rows.iter().map(|r| r.name.chars().count()).max().unwrap_or(4).clamp(4, 32);
+        let (mut pending, mut done, mut skipped, mut failed) = (0, 0, 0, 0);
+        let lines: Vec<Line> = rows
+            .iter()
+            .map(|row| {
+                let mut line = Line::new();
+                let (glyph, color) = match &row.outcome {
+                    Outcome::Pending => (self.spinner(), Palette::cyan()),
+                    Outcome::Done(_) => ("✓", Palette::green()),
+                    Outcome::Skipped(_) => ("-", Palette::dim()),
+                    Outcome::Failed(_) => ("✗", Palette::red()),
+                };
+                line.color(glyph, color);
+                line.push(format!(" {:<name_w$}  ", truncate(&row.name, name_w)));
+                match &row.outcome {
+                    Outcome::Pending => pending += 1,
+                    Outcome::Done(message) => {
+                        done += 1;
+                        line.push(message);
+                    }
+                    Outcome::Skipped(message) => {
+                        skipped += 1;
+                        line.color(message, Palette::dim());
+                    }
+                    Outcome::Failed(message) => {
+                        failed += 1;
+                        line.color(headline(message), Palette::red());
+                    }
+                }
+                line
+            })
+            .collect();
+        let mut tally = Line::new();
+        if pending > 0 {
+            tally.color(format!("{} of {} finished {}", rows.len() - pending, rows.len(), self.spinner()), Palette::cyan());
+        } else {
+            tally.color(format!("{done} done"), Palette::green());
+            tally.color(format!(" · {skipped} skipped"), Palette::dim());
+            tally.color(format!(" · {failed} failed"), if failed > 0 { Palette::red() } else { Palette::dim() });
+        }
+        if rows.len() > max_rows {
+            tally.color(format!("  (scroll for all {})", rows.len()), Palette::dim());
+        }
+        let height = LINE_HEIGHT * rows.len().clamp(1, max_rows) as f32;
+        let lines = Arc::new(lines);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div().h(height).child(
+                    uniform_list("results", lines.len(), move |range: Range<usize>, _, _| {
+                        range
+                            .map(|ix| div().h(LINE_HEIGHT).whitespace_nowrap().overflow_hidden().child(lines[ix].build()))
+                            .collect::<Vec<_>>()
+                    })
+                    .track_scroll(scroll)
+                    .size_full(),
+                ),
+            )
+            .child(tally.build())
+            .child(div().text_color(Palette::blue()).child("<esc>/<enter>: close"))
+            .into_any_element()
     }
 
     fn help_body(&self, scroll: &UniformListScrollHandle, _cx: &mut Context<Self>) -> AnyElement {
@@ -923,7 +1015,7 @@ impl Render for Workspace {
         };
 
         let bottom = self.bottom_bar(window, cx);
-        let dialog = self.dialog_layer(cx);
+        let dialog = self.dialog_layer(window, cx);
 
         div()
             .key_context("Workspace")
@@ -974,6 +1066,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::fast_forward_all))
             .on_action(cx.listener(Self::open_in_lazygit))
+            .on_action(cx.listener(Self::toggle_mark))
+            .on_action(cx.listener(Self::toggle_mark_all))
+            .on_action(cx.listener(Self::checkout_by_name))
+            .on_action(cx.listener(Self::new_branch_in_repos))
+            .on_action(cx.listener(Self::switch_to_default))
             .on_action(cx.listener(Self::toggle_stage))
             .on_action(cx.listener(Self::toggle_stage_all))
             .on_action(cx.listener(Self::commit))
@@ -1084,6 +1181,15 @@ fn status_line(store: &RepoStore) -> Line {
         line.push(entry.name());
     }
     line
+}
+
+/// `✓ ` before a marked repo, blank before the others, while any repo is marked.
+fn mark_column(line: &mut Line, marked: bool) {
+    if marked {
+        line.bold("✓ ", Palette::cyan());
+    } else {
+        line.push("  ");
+    }
 }
 
 fn overview_header(name_w: usize) -> Line {
@@ -1320,7 +1426,15 @@ fn author_color(author: &str) -> Hsla {
 
 fn hints(view: View) -> String {
     let parts: &[(&str, &str)] = match view {
-        View::Repos => &[("Fetch", "f"), ("Fetch all", "F"), ("Pull", "p"), ("Update all", "U"), ("lazygit", "o"), ("Filter", "/")],
+        View::Repos => &[
+            ("Mark", "<space>"),
+            ("Checkout", "c"),
+            ("New branch", "n"),
+            ("Default branch", "m"),
+            ("Pull", "p"),
+            ("Fetch all", "F"),
+            ("Update", "U"),
+        ],
         View::Files => &[("Stage", "<space>"), ("Stage all", "a"), ("Commit", "c"), ("Discard", "d"), ("Stash", "s")],
         View::Branches => &[("Checkout", "<space>"), ("New", "n"), ("Delete", "d"), ("Fast-forward", "f"), ("Upstream", "u")],
         View::Remotes => &[("Checkout", "<space>"), ("New branch", "n"), ("Fetch", "f")],
