@@ -196,6 +196,17 @@ keymap! {
     "?", "Help" => CloseDialog, "";
     "j", "Help" => SelectNext, "";
     "k", "Help" => SelectPrev, "";
+    "down", "Help" => SelectNext, "";
+    "up", "Help" => SelectPrev, "";
+    ".", "Help" => PageDown, "";
+    ",", "Help" => PageUp, "";
+    // Popups: only the multi-repo results list scrolls; the others ignore these.
+    "j", "Popup" => SelectNext, "";
+    "k", "Popup" => SelectPrev, "";
+    "down", "Popup" => SelectNext, "";
+    "up", "Popup" => SelectPrev, "";
+    ".", "Popup" => PageDown, "";
+    ",", "Popup" => PageUp, "";
 }
 
 /// lazygit-style key label, e.g. `shift-j` → `J`, `ctrl-d` → `<c-d>`, `cmd-r` → `⌘R`.

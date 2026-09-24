@@ -900,7 +900,7 @@ impl Workspace {
             tally.color(format!(" · {failed} failed"), if failed > 0 { Palette::red() } else { Palette::dim() });
         }
         if rows.len() > max_rows {
-            tally.color(format!("  (scroll for all {})", rows.len()), Palette::dim());
+            tally.color(format!("  (j/k to scroll all {})", rows.len()), Palette::dim());
         }
         let height = LINE_HEIGHT * rows.len().clamp(1, max_rows) as f32;
         let lines = Arc::new(lines);

@@ -15,6 +15,7 @@ use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstr
 use crate::batch::BatchRow;
 use crate::keymap::*;
 use crate::store::RepoStore;
+use crate::theme::LINE_HEIGHT;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Panel {
@@ -165,7 +166,6 @@ pub struct MainState {
     generation: u64,
     pub title: SharedString,
     pub content: MainContent,
-    pub top: usize,
     pub scroll: UniformListScrollHandle,
     pub scroll2: UniformListScrollHandle,
     task: Option<Task<()>>,
@@ -196,7 +196,6 @@ pub enum Dialog {
     },
     Help {
         scroll: UniformListScrollHandle,
-        top: usize,
     },
     /// Per-repo outcomes of a multi-repo action, filled in as each repo finishes.
     Results {
@@ -251,6 +250,7 @@ pub struct Workspace {
     _ticker: Task<()>,
 }
 
+/// Page size for lists that haven't been laid out yet.
 pub const PAGE: isize = 10;
 
 impl Workspace {
@@ -291,7 +291,6 @@ impl Workspace {
                 generation: 0,
                 title: "".into(),
                 content: MainContent::Overview,
-                top: 0,
                 scroll: UniformListScrollHandle::new(),
                 scroll2: UniformListScrollHandle::new(),
                 task: None,
@@ -437,7 +436,8 @@ impl Workspace {
         let next = to(current, len).min(len - 1);
         let list = self.list(view);
         list.selected = next;
-        list.scroll.scroll_to_item(next, ScrollStrategy::Top);
+        // Scroll only as far as needed to keep the cursor in view, like lazygit.
+        list.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         self.after_change(cx);
     }
 
@@ -572,9 +572,8 @@ impl Workspace {
         self.main.generation = generation;
         self.main.title = title;
         if !same_item {
-            self.main.top = 0;
-            self.main.scroll.scroll_to_item(0, ScrollStrategy::Top);
-            self.main.scroll2.scroll_to_item(0, ScrollStrategy::Top);
+            scroll_to_edge(&self.main.scroll, false);
+            scroll_to_edge(&self.main.scroll2, false);
         }
         let location = store.selected_entry().map(|e| e.location.clone());
         let file = match &key {
@@ -610,16 +609,16 @@ impl Workspace {
         }
     }
 
-    fn scroll_main(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let len = match &self.main.content {
-            MainContent::Text { lines, .. } => lines.len(),
-            MainContent::Split { unstaged, staged } => unstaged.len().max(staged.len()),
-            MainContent::Overview => self.store.read(cx).repos.len() + 1,
-            MainContent::Status => 20,
-        };
-        self.main.top = self.main.top.saturating_add_signed(delta).min(len.saturating_sub(1));
-        self.main.scroll.scroll_to_item(self.main.top, ScrollStrategy::Top);
-        self.main.scroll2.scroll_to_item(self.main.top, ScrollStrategy::Top);
+    /// Scrolls the main view (both halves of a staged/unstaged split) by `lines`.
+    fn scroll_main(&mut self, lines: isize, cx: &mut Context<Self>) {
+        scroll_lines(&self.main.scroll, lines);
+        scroll_lines(&self.main.scroll2, lines);
+        cx.notify();
+    }
+
+    fn scroll_main_to_edge(&mut self, bottom: bool, cx: &mut Context<Self>) {
+        scroll_to_edge(&self.main.scroll, bottom);
+        scroll_to_edge(&self.main.scroll2, bottom);
         cx.notify();
     }
 
@@ -681,11 +680,21 @@ impl Workspace {
         self.switch_tab(-1, cx);
     }
 
+    /// The scrollable popup that's open, if any: `Some(None)` for a popup that doesn't scroll.
+    fn popup_scroll(&self) -> Option<Option<&UniformListScrollHandle>> {
+        match self.dialog.as_ref()? {
+            Dialog::Help { scroll } | Dialog::Results { scroll, .. } => Some(Some(scroll)),
+            _ => Some(None),
+        }
+    }
+
+    /// `j`/`k` and friends: move the cursor in a list, or scroll the main view or popup.
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let Some(Dialog::Help { scroll, top }) = &mut self.dialog {
-            *top = top.saturating_add_signed(delta);
-            scroll.scroll_to_item(*top, ScrollStrategy::Top);
-            cx.notify();
+        if let Some(popup) = self.popup_scroll() {
+            if let Some(scroll) = popup {
+                scroll_lines(scroll, delta);
+                cx.notify();
+            }
             return;
         }
         match self.current_view() {
@@ -694,6 +703,19 @@ impl Workspace {
             view => self.move_by(view, delta, cx),
         }
     }
+
+    /// `.`/`,`: a page is what fits in the view being moved, less one line of overlap.
+    fn page(&mut self, pages: isize, cx: &mut Context<Self>) {
+        let rows = match self.popup_scroll() {
+            Some(Some(scroll)) => visible_rows(scroll),
+            Some(None) => return,
+            None => match self.current_view() {
+                View::Main => visible_rows(&self.main.scroll),
+                view => self.lists.get(&view).map_or(PAGE, |list| visible_rows(&list.scroll)),
+            },
+        };
+        self.step(pages * (rows - 1).max(1), cx);
+    }
     pub fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         self.step(1, cx);
     }
@@ -701,21 +723,21 @@ impl Workspace {
         self.step(-1, cx);
     }
     pub fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.step(PAGE, cx);
+        self.page(1, cx);
     }
     pub fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.step(-PAGE, cx);
+        self.page(-1, cx);
     }
     pub fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
         match self.current_view() {
-            View::Main => self.scroll_main(isize::MIN / 2, cx),
+            View::Main => self.scroll_main_to_edge(false, cx),
             view if view.is_list() => self.move_cursor(view, |_, _| 0, cx),
             _ => {}
         }
     }
     pub fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
         match self.current_view() {
-            View::Main => self.scroll_main(isize::MAX / 2, cx),
+            View::Main => self.scroll_main_to_edge(true, cx),
             view if view.is_list() => self.move_cursor(view, |_, len| len - 1, cx),
             _ => {}
         }
@@ -727,10 +749,10 @@ impl Workspace {
         self.scroll_main(-3, cx);
     }
     pub fn half_page_main_down(&mut self, _: &HalfPageMainDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_main(15, cx);
+        self.scroll_main(visible_rows(&self.main.scroll) / 2, cx);
     }
     pub fn half_page_main_up(&mut self, _: &HalfPageMainUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_main(-15, cx);
+        self.scroll_main(-visible_rows(&self.main.scroll) / 2, cx);
     }
 
     pub fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
@@ -780,7 +802,6 @@ impl Workspace {
         self.open_dialog(
             Dialog::Help {
                 scroll: UniformListScrollHandle::new(),
-                top: 0,
             },
             window,
             cx,
@@ -1330,6 +1351,33 @@ impl Workspace {
 enum CheckoutTarget {
     Ref(String),
     Remote(ubergit_core::RemoteBranch),
+}
+
+/// Scrolls a list by `lines` rows (negative is up) from wherever it is now, so the keys
+/// and the mouse wheel move one shared position. (`scroll_to_item` can't do this: it does
+/// nothing while the target row is already on screen.)
+fn scroll_lines(handle: &UniformListScrollHandle, lines: isize) {
+    let mut state = handle.0.borrow_mut();
+    // A pending scroll-to-item would override this at the next layout.
+    state.deferred_scroll_to_item = None;
+    let base = &state.base_handle;
+    let offset = base.offset();
+    let y = (offset.y - LINE_HEIGHT * lines as f32).clamp(-base.max_offset().y, px(0.));
+    base.set_offset(point(offset.x, y));
+}
+
+fn scroll_to_edge(handle: &UniformListScrollHandle, bottom: bool) {
+    let mut state = handle.0.borrow_mut();
+    state.deferred_scroll_to_item = None;
+    let base = &state.base_handle;
+    let y = if bottom { -base.max_offset().y } else { px(0.) };
+    base.set_offset(point(base.offset().x, y));
+}
+
+/// Rows that fit in a list's viewport, as of its last layout.
+fn visible_rows(handle: &UniformListScrollHandle) -> isize {
+    let height = handle.0.borrow().base_handle.bounds().size.height;
+    ((height / LINE_HEIGHT) as isize).max(1)
 }
 
 fn short_rev(rev: &str) -> &str {

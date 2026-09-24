@@ -1,6 +1,7 @@
 //! Scripted keystrokes and offscreen screenshots, for checking the UI without a human.
 //! Build with `--features screenshot` and set `UBERGIT_SCRIPT`, e.g.
 //! `wait 2000; shot /tmp/a.png; keys l j; type hello; key enter; shot /tmp/b.png; quit`.
+//! Mouse steps take window points: `drag x1 y1 x2 y2`, `wheel x y pixels`.
 
 use std::time::Duration;
 
@@ -91,6 +92,29 @@ pub fn run(window: AnyWindowHandle, script: String, cx: &mut App) {
                             .ok();
                         pause(16).await;
                     }
+                }
+                // wheel x y pixels: scroll at a window point; positive pixels scroll down.
+                "wheel" => {
+                    let n: Vec<f32> = arg.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+                    let [x, y, pixels] = n[..] else {
+                        eprintln!("automation: wheel needs x y pixels");
+                        continue;
+                    };
+                    let event = PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(px(x), px(y)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-pixels))),
+                        ..Default::default()
+                    });
+                    window
+                        .update(cx, |_, window, cx| {
+                            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                                position: point(px(x), px(y)),
+                                ..Default::default()
+                            }), cx);
+                            window.draw(cx).clear(cx);
+                            window.dispatch_event(event, cx);
+                        })
+                        .ok();
                 }
                 "quit" => {
                     cx.update(|cx| cx.quit());
