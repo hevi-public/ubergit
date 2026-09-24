@@ -356,15 +356,16 @@ impl RepoStore {
     }
 
     /// Runs a mutating operation on a repo, marking it busy and refreshing afterwards.
-    pub fn run_op<Fut>(
+    pub fn run_op<T, Fut>(
         &mut self,
         root: &Path,
         label: &str,
         op: impl FnOnce(Git, RepoLocation) -> Fut,
         cx: &mut Context<Self>,
-    ) -> Task<Result<GitOutput, GitError>>
+    ) -> Task<Result<T, GitError>>
     where
-        Fut: Future<Output = Result<GitOutput, GitError>> + Send + 'static,
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, GitError>> + Send + 'static,
     {
         let Some(ix) = self.index_of(root) else {
             return Task::ready(Err(GitError::Failed {
@@ -416,10 +417,17 @@ impl RepoStore {
         if self.fetch_round.is_some() {
             return;
         }
+        let roots = self.repos.iter().map(|r| r.location.root.clone()).collect();
+        self.fetch_many(roots, cx);
+    }
+
+    /// Fetches the given repos that have a remote, once per shared git dir. Joins the
+    /// running round, if any, so the bottom bar counts them all.
+    pub fn fetch_many(&mut self, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut seen = HashSet::new();
-        let targets: Vec<PathBuf> = self
-            .repos
+        let targets: Vec<PathBuf> = roots
             .iter()
+            .filter_map(|root| self.entry(root))
             .filter(|r| r.busy.is_none() && r.error.is_none())
             .filter(|r| r.summary.as_ref().is_some_and(RepoSummary::has_remote))
             .filter(|r| seen.insert(r.location.common_dir.clone()))
@@ -428,7 +436,7 @@ impl RepoStore {
         if targets.is_empty() {
             return;
         }
-        self.fetch_round = Some((0, targets.len()));
+        self.fetch_round.get_or_insert((0, 0)).1 += targets.len();
         for root in targets {
             let task = self.fetch(&root, cx);
             cx.spawn(async move |this, cx| {
@@ -447,21 +455,5 @@ impl RepoStore {
             .detach();
         }
         cx.notify();
-    }
-
-    /// Repos that `fast_forward_all` would update: clean, on a branch, strictly behind.
-    pub fn fast_forward_candidates(&self) -> Vec<PathBuf> {
-        self.repos
-            .iter()
-            .filter(|r| r.busy.is_none())
-            .filter(|r| {
-                r.summary.as_ref().is_some_and(|s| {
-                    s.changes.is_clean()
-                        && s.op.is_none()
-                        && matches!(s.upstream, ubergit_core::Upstream::Tracking { ahead: 0, behind, .. } if behind > 0)
-                })
-            })
-            .map(|r| r.location.root.clone())
-            .collect()
     }
 }

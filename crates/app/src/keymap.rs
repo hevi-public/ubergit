@@ -52,6 +52,12 @@ actions!(
         Push,
         FastForwardAll,
         OpenInLazygit,
+        // repos: marks and multi-repo actions
+        ToggleMark,
+        ToggleMarkAll,
+        CheckoutByName,
+        NewBranchInRepos,
+        SwitchToDefault,
         // files
         ToggleStage,
         ToggleStageAll,
@@ -101,7 +107,8 @@ keymap! {
     "l", "Panels" => NextPanel, "Next panel";
     "right", "Panels" => NextPanel, "";
     "tab", "Panels" => NextPanel, "";
-    "ctrl-r", "Panels" => FocusRepos, "Focus repos (switch repository)";
+    "cmd-r", "Panels" => FocusRepos, "Focus repos (switch repository)";
+    "ctrl-r", "Panels" => FocusRepos, "";
     "1", "Panels" => FocusStatus, "Focus status";
     "2", "Panels" => FocusFiles, "Focus files";
     "3", "Panels" => FocusBranches, "Focus branches";
@@ -129,7 +136,7 @@ keymap! {
     "pageup", "Panels" => HalfPageMainUp, "";
     "ctrl-u", "Panels" => HalfPageMainUp, "";
     "enter", "Panels" => Enter, "View item / drill in";
-    "escape", "Panels" => Back, "Back / clear filter";
+    "escape", "Panels" => Back, "Back / clear filter / clear marks";
     "/", "Panels" => StartFilter, "Filter list";
     "?", "Panels" => ToggleHelp, "Keybindings";
     "+", "Panels" => NextScreenMode, "Next screen mode (normal/half/full)";
@@ -143,9 +150,17 @@ keymap! {
     "p", "Panels" => Pull, "Pull";
     "shift-p", "Panels" => Push, "Push";
 
-    // Repos
+    // Repos. With repos marked, these run on every marked repo, else on the selected one.
+    "space", "Repos" => ToggleMark, "Mark / unmark repo (actions then run on all marked)";
+    "a", "Repos" => ToggleMarkAll, "Mark / unmark all listed repos";
+    "c", "Repos" => CheckoutByName, "Check out a branch by name";
+    "n", "Repos" => NewBranchInRepos, "New branch from HEAD";
+    "m", "Repos" => SwitchToDefault, "Check out the default branch and fast-forward it";
+    "f", "Repos" => Fetch, "Fetch";
+    "p", "Repos" => Pull, "Pull";
+    "shift-p", "Repos" => Push, "Push";
     "shift-f", "Repos" => FetchAll, "Fetch all repositories";
-    "shift-u", "Repos" => FastForwardAll, "Fast-forward all clean repos that are behind";
+    "shift-u", "Repos" => FastForwardAll, "Fast-forward clean repos that are behind (marked, else all)";
     "o", "Repos" => OpenInLazygit, "Open in lazygit";
 
     // Files
@@ -183,7 +198,7 @@ keymap! {
     "k", "Help" => SelectPrev, "";
 }
 
-/// lazygit-style key label, e.g. `shift-j` → `J`, `ctrl-r` → `<c-r>`.
+/// lazygit-style key label, e.g. `shift-j` → `J`, `ctrl-d` → `<c-d>`, `cmd-r` → `⌘R`.
 pub fn display_key(key: &str) -> String {
     if let Some(letter) = key.strip_prefix("shift-")
         && letter.len() == 1
@@ -192,6 +207,9 @@ pub fn display_key(key: &str) -> String {
     }
     if let Some(rest) = key.strip_prefix("ctrl-") {
         return format!("<c-{rest}>");
+    }
+    if let Some(rest) = key.strip_prefix("cmd-") {
+        return format!("⌘{}", rest.to_uppercase());
     }
     match key {
         "space" | "enter" | "escape" | "tab" | "up" | "down" | "left" | "right" | "home"

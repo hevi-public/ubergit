@@ -70,6 +70,12 @@ impl ChangeCounts {
     pub fn is_clean(&self) -> bool {
         *self == ChangeCounts::default()
     }
+
+    /// Staged, unstaged or conflicted changes to tracked files. Untracked files don't
+    /// count: they stay put across checkouts, and git refuses if one would be overwritten.
+    pub fn has_tracked_changes(&self) -> bool {
+        self.staged + self.unstaged + self.conflicted > 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

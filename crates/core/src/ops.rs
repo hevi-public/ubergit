@@ -193,3 +193,150 @@ pub fn is_push_rejected(err: &GitError) -> bool {
 pub async fn fast_forward_head(git: &Git, repo: &RepoLocation) -> Result {
     git.write(&repo.root, ["merge", "--ff-only", "@{upstream}"]).await
 }
+
+/// Loose check for a branch name the user typed; git has the final say. Mainly keeps a
+/// name from being read as an option or a revision expression.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains(|c: char| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+}
+
+/// What [`switch_branch`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Switched {
+    /// Checked out the existing local branch.
+    Local,
+    /// Created the local branch, tracking this remote branch (e.g. `origin/feat`).
+    Tracking(String),
+    /// No local or remote branch has that name; nothing changed.
+    Missing,
+}
+
+/// Switches to branch `name`: the local branch if there is one, otherwise a new local
+/// branch tracking `<remote>/<name>` (primary remote first). `git switch` only accepts
+/// branches, so a name can never be taken for a path.
+pub async fn switch_branch(git: &Git, repo: &RepoLocation, name: &str, remotes: &[String]) -> Result<Switched> {
+    let primary = crate::summary::primary_remote(remotes, None);
+    let mut ordered: Vec<&str> = primary.into_iter().collect();
+    ordered.extend(remotes.iter().map(String::as_str).filter(|r| Some(*r) != primary));
+
+    let local = format!("refs/heads/{name}");
+    let remote_refs: Vec<String> = ordered.iter().map(|r| format!("refs/remotes/{r}/{name}")).collect();
+    let mut args = vec!["for-each-ref".to_string(), "--format=%(refname)".into(), local.clone()];
+    args.extend(remote_refs.iter().cloned());
+    let out = git.read(&repo.root, args).await?.stdout_str();
+    // A pattern also matches refs below it (`feat` matches `feat/x`), so compare exactly.
+    let exists = |full: &str| out.lines().any(|line| line == full);
+
+    if exists(&local) {
+        git.write(&repo.root, ["switch", name]).await?;
+        return Ok(Switched::Local);
+    }
+    for (remote, full) in ordered.iter().zip(&remote_refs) {
+        if exists(full) {
+            let start = format!("{remote}/{name}");
+            git.write(&repo.root, ["switch", "--track", "-c", name, &start]).await?;
+            return Ok(Switched::Tracking(start));
+        }
+    }
+    Ok(Switched::Missing)
+}
+
+/// Splits a default branch into its local name and remote:
+/// `refs/remotes/origin/main` → (`main`, `origin`), `refs/heads/main` → (`main`, none).
+pub fn default_branch_parts(default: &DefaultBranch, remotes: &[String]) -> (String, Option<String>) {
+    if let Some(name) = default.full_ref.strip_prefix("refs/heads/") {
+        return (name.to_string(), None);
+    }
+    let short = default.full_ref.strip_prefix("refs/remotes/").unwrap_or(&default.short);
+    // Remote names may contain '/', so take the longest remote that prefixes it.
+    let remote = remotes
+        .iter()
+        .filter(|r| short.starts_with(&format!("{r}/")))
+        .max_by_key(|r| r.len());
+    match remote {
+        Some(remote) => (short[remote.len() + 1..].to_string(), Some(remote.clone())),
+        None => match short.split_once('/') {
+            Some((remote, name)) => (name.to_string(), Some(remote.to_string())),
+            None => (short.to_string(), None),
+        },
+    }
+}
+
+/// What [`switch_to_default`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultSwitch {
+    /// Local name of the default branch, e.g. `main`.
+    pub branch: String,
+    /// `None` when the default branch was already checked out.
+    pub switched: Option<Switched>,
+    /// The branch's upstream, e.g. `origin/main`, if it has one.
+    pub upstream: Option<String>,
+    /// Divergence from the upstream before fast-forwarding.
+    pub ahead: u32,
+    pub behind: u32,
+    pub fast_forwarded: bool,
+}
+
+/// Checks out the default branch (creating it to track the remote one if needed), then
+/// fast-forwards it to its upstream. Offline: uses whatever the last fetch brought in.
+/// `current` is the checked-out branch, if any.
+pub async fn switch_to_default(
+    git: &Git,
+    repo: &RepoLocation,
+    default: &DefaultBranch,
+    remotes: &[String],
+    current: Option<&str>,
+) -> Result<DefaultSwitch> {
+    let (branch, remote) = default_branch_parts(default, remotes);
+    let mut result = DefaultSwitch {
+        branch: branch.clone(),
+        switched: None,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        fast_forwarded: false,
+    };
+    if current != Some(branch.as_str()) {
+        let remotes: Vec<String> = remote.into_iter().collect();
+        let switched = switch_branch(git, repo, &branch, &remotes).await?;
+        let missing = switched == Switched::Missing;
+        result.switched = Some(switched);
+        if missing {
+            return Ok(result);
+        }
+    }
+    let upstream = git
+        .run(
+            GitCommand::new(
+                &repo.root,
+                CmdKind::Read,
+                ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+            )
+            .ok_codes([128]), // no upstream configured, or it's gone
+        )
+        .await?
+        .stdout_str()
+        .trim()
+        .to_string();
+    if upstream.is_empty() {
+        return Ok(result);
+    }
+    let counts = git
+        .read(&repo.root, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .await?;
+    let (ahead, behind) = crate::git::parse::left_right(&counts.stdout_str()).unwrap_or((0, 0));
+    result.upstream = Some(upstream);
+    result.ahead = ahead;
+    result.behind = behind;
+    if behind > 0 && ahead == 0 {
+        fast_forward_head(git, repo).await?;
+        result.fast_forwarded = true;
+    }
+    Ok(result)
+}
