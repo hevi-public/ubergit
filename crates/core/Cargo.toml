@@ -1,0 +1,25 @@
+[package]
+name = "ubergit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+walkdir.workspace = true
+ignore.workspace = true
+notify.workspace = true
+futures.workspace = true
+async-process.workspace = true
+async-lock.workspace = true
+async-io.workspace = true
+futures-lite.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

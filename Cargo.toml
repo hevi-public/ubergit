@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+ubergit-core = { path = "crates/core" }
+# gpui-kit pins gpui-pre exactly; bump both together, never mix with a Zed git dep.
+gpui-kit = "=0.6.6"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+walkdir = "2.5"
+ignore = "0.4.33"
+notify = "8.2"
+rlimit = "0.11"
+async-process = "2.5"
+async-lock = "3.4"
+async-io = "2"
+futures-lite = "2"
+futures = "0.3"
+async-channel = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+tempfile = "3"
+
+[profile.dev]
+split-debuginfo = "unpacked"
+
+# gpui's layout/text/svg stack is painfully slow unoptimised; same overrides as Zed.
+[profile.dev.package]
+taffy = { opt-level = 3 }
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

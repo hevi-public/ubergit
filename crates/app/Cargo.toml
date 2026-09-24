@@ -1,0 +1,21 @@
+[package]
+name = "ubergit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "lazygit-style GUI for managing many git repositories at once"
+
+[features]
+# Scripted keystrokes + offscreen screenshots (UBERGIT_SCRIPT); needs gpui's test support.
+screenshot = ["gpui-kit/test-support", "dep:image"]
+
+[dependencies]
+ubergit-core.workspace = true
+gpui-kit.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rlimit.workspace = true
+image = { workspace = true, optional = true }
