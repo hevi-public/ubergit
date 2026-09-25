@@ -80,8 +80,70 @@ pub async fn last_commit_message(git: &Git, repo: &RepoLocation) -> Result<Strin
     Ok(out.stdout_str().trim_end().to_string())
 }
 
-pub async fn stash_all(git: &Git, repo: &RepoLocation) -> Result {
-    git.write(&repo.root, ["stash", "push", "--include-untracked"]).await
+/// What [`stash`] puts away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StashKind {
+    /// Every change, untracked files included, leaving a clean worktree.
+    All,
+    /// Every change, but staged changes also stay staged in the worktree.
+    KeepIndex,
+    /// Changes to tracked files; untracked files stay.
+    Tracked,
+    /// Only what's staged.
+    Staged,
+}
+
+/// `git stash push`. Without a message git writes its own: `WIP on <branch>: <commit>`.
+pub async fn stash(git: &Git, repo: &RepoLocation, kind: StashKind, message: Option<&str>) -> Result {
+    let mut args = vec!["stash", "push"];
+    args.extend(match kind {
+        StashKind::All => &["--include-untracked"][..],
+        StashKind::KeepIndex => &["--include-untracked", "--keep-index"],
+        StashKind::Tracked => &[],
+        StashKind::Staged => &["--staged"],
+    });
+    if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+        args.extend(["-m", message]);
+    }
+    git.write(&repo.root, args).await
+}
+
+/// Splits a stash subject into its branch and message: `On main: fix` → (`main`, `fix`),
+/// `WIP on main: 1a2b3c4 subject` → (`main`, `1a2b3c4 subject`).
+pub fn stash_subject_parts(subject: &str) -> Option<(&str, &str)> {
+    let rest = subject.strip_prefix("On ").or_else(|| subject.strip_prefix("WIP on "))?;
+    rest.split_once(": ")
+}
+
+/// Renames a stash. Git can't edit a stash message in place, so this drops the entry and
+/// stores the same commit again with the new message; the stash moves to the top.
+pub async fn stash_rename(git: &Git, repo: &RepoLocation, stash: &StashEntry, message: &str) -> Result {
+    let selector = format!("stash@{{{}}}", stash.index);
+    let oid = git.read(&repo.root, ["rev-parse", &selector]).await?.stdout_str().trim().to_string();
+    // Keep git's `On <branch>: ` prefix so it reads like any other stash.
+    let message = match stash_subject_parts(&stash.subject) {
+        Some((branch, _)) => format!("On {branch}: {message}"),
+        None => message.to_string(),
+    };
+    git.write(&repo.root, ["stash", "drop", "--quiet", &selector]).await?;
+    git.write(&repo.root, ["stash", "store", "-m", &message, &oid])
+        .await
+        .map_err(|err| match err {
+            // The dropped stash's commit still exists; say how to get it back.
+            GitError::Failed { command, code, stderr, stdout } => GitError::Failed {
+                command,
+                code,
+                stderr: format!("{stderr}\nThe stash was dropped but its commit is kept. Restore it with:\n  git stash store -m '{message}' {oid}"),
+                stdout,
+            },
+            other => other,
+        })
+}
+
+/// `git stash branch`: a new branch at the commit the stash was made on, with the stash
+/// applied (and dropped if that worked).
+pub async fn stash_branch(git: &Git, repo: &RepoLocation, index: usize, name: &str) -> Result {
+    git.write(&repo.root, ["stash", "branch", name, &format!("stash@{{{index}}}")]).await
 }
 
 pub async fn stash_apply(git: &Git, repo: &RepoLocation, index: usize) -> Result {

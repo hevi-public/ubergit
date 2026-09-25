@@ -65,6 +65,7 @@ actions!(
         Amend,
         Discard,
         StashAll,
+        StashOptions,
         // branches
         Checkout,
         CheckoutPrevious,
@@ -76,6 +77,8 @@ actions!(
         StashApply,
         StashPop,
         StashDrop,
+        RenameStash,
+        BranchFromStash,
         // dialogs
         ConfirmDialog,
         CloseDialog,
@@ -169,7 +172,8 @@ keymap! {
     "c", "Files" => Commit, "Commit";
     "shift-a", "Files" => Amend, "Amend last commit";
     "d", "Files" => Discard, "Discard changes";
-    "s", "Files" => StashAll, "Stash all changes";
+    "s", "Files" => StashAll, "Stash all changes (asks for a message)";
+    "shift-s", "Files" => StashOptions, "Stash options (keep index, tracked only, staged only)";
 
     // Branches, remote branches, tags
     "space", "Branches" => Checkout, "Checkout";
@@ -188,6 +192,8 @@ keymap! {
     "space", "Stash" => StashApply, "Apply";
     "g", "Stash" => StashPop, "Pop";
     "d", "Stash" => StashDrop, "Drop";
+    "r", "Stash" => RenameStash, "Rename";
+    "n", "Stash" => BranchFromStash, "New branch from stash";
 
     // Popups
     "escape", "Dialog" => CloseDialog, "Close";

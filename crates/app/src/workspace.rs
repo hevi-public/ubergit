@@ -10,6 +10,7 @@ use gpui_kit::base::ResizableState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::{prelude::*, *};
 use ubergit_core::detail::{self, FileDiff, RepoDetail};
+use ubergit_core::ops::StashKind;
 use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstream, ops};
 
 use crate::batch::BatchRow;
@@ -174,6 +175,24 @@ pub struct MainState {
 pub type ConfirmFn = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 pub type SubmitFn = Box<dyn FnOnce(&mut Workspace, String, &mut Window, &mut Context<Workspace>)>;
 
+/// One choice in a lazygit-style menu popup.
+pub struct MenuItem {
+    /// Picks the item directly; shown before its label.
+    pub key: &'static str,
+    pub label: SharedString,
+    pub action: Option<ConfirmFn>,
+}
+
+impl MenuItem {
+    pub fn new(
+        key: &'static str,
+        label: impl Into<SharedString>,
+        action: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        Self { key, label: label.into(), action: Some(Box::new(action)) }
+    }
+}
+
 pub enum Dialog {
     Confirm {
         title: SharedString,
@@ -184,6 +203,13 @@ pub enum Dialog {
         title: SharedString,
         input: Entity<InputState>,
         on_submit: Option<SubmitFn>,
+        /// Submit an empty value too (otherwise enter on an empty prompt does nothing).
+        allow_empty: bool,
+    },
+    Menu {
+        title: SharedString,
+        items: Vec<MenuItem>,
+        selected: usize,
     },
     Commit {
         input: Entity<TextareaState>,
@@ -690,6 +716,11 @@ impl Workspace {
 
     /// `j`/`k` and friends: move the cursor in a list, or scroll the main view or popup.
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(Dialog::Menu { items, selected, .. }) = &mut self.dialog {
+            *selected = selected.saturating_add_signed(delta).min(items.len().saturating_sub(1));
+            cx.notify();
+            return;
+        }
         if let Some(popup) = self.popup_scroll() {
             if let Some(scroll) = popup {
                 scroll_lines(scroll, delta);
@@ -879,12 +910,17 @@ impl Workspace {
                     f(self, window, cx);
                 }
             }
-            Dialog::Prompt { input, on_submit, .. } => {
+            Dialog::Prompt { input, on_submit, allow_empty, .. } => {
                 let value = input.read(cx).value().trim().to_string();
                 if let Some(f) = on_submit
-                    && !value.is_empty()
+                    && (allow_empty || !value.is_empty())
                 {
                     f(self, value, window, cx);
+                }
+            }
+            Dialog::Menu { mut items, selected, .. } => {
+                if let Some(action) = items.get_mut(selected).and_then(|item| item.action.take()) {
+                    action(self, window, cx);
                 }
             }
             Dialog::Commit { input, amend, root } => {
@@ -939,10 +975,58 @@ impl Workspace {
                 title: title.into(),
                 input,
                 on_submit: Some(Box::new(on_submit)),
+                allow_empty: false,
             },
             window,
             cx,
         );
+    }
+
+    /// A prompt whose answer may be empty; `placeholder` says what empty means.
+    pub fn optional_prompt(
+        &mut self,
+        title: impl Into<SharedString>,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_submit: impl FnOnce(&mut Workspace, String, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        self.open_dialog(
+            Dialog::Prompt {
+                title: title.into(),
+                input,
+                on_submit: Some(Box::new(on_submit)),
+                allow_empty: true,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn menu(&mut self, title: impl Into<SharedString>, items: Vec<MenuItem>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_dialog(Dialog::Menu { title: title.into(), items, selected: 0 }, window, cx);
+    }
+
+    /// Runs a menu item picked by its key or a click.
+    pub fn pick_menu_item(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Dialog::Menu { selected, .. }) = &mut self.dialog {
+            *selected = ix;
+            self.confirm_dialog(&ConfirmDialog, window, cx);
+        }
+    }
+
+    /// A menu item's own key picks it, like lazygit's menus.
+    pub fn menu_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::Menu { items, .. }) = &self.dialog else { return };
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.modified() {
+            return;
+        }
+        if let Some(ix) = items.iter().position(|item| item.key == keystroke.key) {
+            cx.stop_propagation();
+            self.pick_menu_item(ix, window, cx);
+        }
     }
 
     pub fn show_error(&mut self, title: &str, err: &GitError, window: &mut Window, cx: &mut Context<Self>) {
@@ -1183,7 +1267,48 @@ impl Workspace {
     }
 
     pub fn stash_all(&mut self, _: &StashAll, window: &mut Window, cx: &mut Context<Self>) {
-        self.op("Stashing", window, cx, |git, loc| async move { ops::stash_all(&git, &loc).await });
+        self.stash(StashKind::All, window, cx);
+    }
+
+    pub fn stash_options(&mut self, _: &StashOptions, window: &mut Window, cx: &mut Context<Self>) {
+        let item = |key, label: &str, kind| MenuItem::new(key, label.to_string(), move |this: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| this.stash(kind, window, cx));
+        let items = vec![
+            item("a", "Stash all changes, including untracked files", StashKind::All),
+            item("i", "Stash all changes but keep the staged ones in place (keep index)", StashKind::KeepIndex),
+            item("t", "Stash changes to tracked files only", StashKind::Tracked),
+            item("s", "Stash staged changes only", StashKind::Staged),
+        ];
+        self.menu("Stash options", items, window, cx);
+    }
+
+    /// Asks for a message, then stashes.
+    fn stash(&mut self, kind: StashKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.selected_root(cx) else { return };
+        let files = self.with_detail(cx, |d, _, _| Some(d.files.clone())).unwrap_or_default();
+        let nothing = match kind {
+            StashKind::Staged => !files.iter().any(|f| f.has_staged()),
+            StashKind::Tracked => files.iter().all(|f| f.kind == FileKind::Untracked),
+            StashKind::All | StashKind::KeepIndex => files.is_empty(),
+        };
+        if nothing {
+            let what = match kind {
+                StashKind::Staged => "No staged changes to stash.",
+                StashKind::Tracked => "No changes to tracked files to stash.",
+                StashKind::All | StashKind::KeepIndex => "Nothing to stash.",
+            };
+            return self.show_message("Stash", what, window, cx);
+        }
+        let title = match kind {
+            StashKind::All => "Stash all changes",
+            StashKind::KeepIndex => "Stash all changes, keep staged",
+            StashKind::Tracked => "Stash tracked changes",
+            StashKind::Staged => "Stash staged changes",
+        };
+        self.optional_prompt(title, "Message (empty for git's default)", window, cx, move |this, message, window, cx| {
+            this.op_on(root, "Stashing", window, cx, move |git, loc| async move {
+                ops::stash(&git, &loc, kind, Some(&message)).await
+            });
+        });
     }
 
     // ---- branches, tags, commits --------------------------------------------------------
@@ -1334,6 +1459,54 @@ impl Workspace {
         let Some(index) = self.selected_stash(cx) else { return };
         self.op("Popping stash", window, cx, move |git, loc| async move {
             ops::stash_pop(&git, &loc, index).await
+        });
+    }
+
+    pub fn rename_stash(&mut self, _: &RenameStash, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stash) = self.with_detail(cx, |d, this, store| {
+            this.selected_ix(View::Stash, store).map(|ix| d.stashes[ix].clone())
+        }) else {
+            return;
+        };
+        let Some(root) = self.selected_root(cx) else { return };
+        // Start from the current message when the user wrote one (not git's `WIP on ...`).
+        let initial = match ops::stash_subject_parts(&stash.subject) {
+            Some((_, message)) if stash.subject.starts_with("On ") => message.to_string(),
+            _ => String::new(),
+        };
+        let title = format!("Rename stash@{{{}}}", stash.index);
+        self.prompt(title, &initial, window, cx, move |this, message, window, cx| {
+            let task = this.store.update(cx, |store, cx| {
+                store.run_op(&root, "Renaming stash", move |git, loc| async move {
+                    ops::stash_rename(&git, &loc, &stash, &message).await
+                }, cx)
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                this.update_in(cx, |this, window, cx| match result {
+                    // The renamed stash is now stash@{0}: keep the cursor on it.
+                    Ok(_) => {
+                        this.list(View::Stash).selected = 0;
+                        this.after_change(cx);
+                    }
+                    Err(err) => this.show_error("Rename stash", &err, window, cx),
+                })
+                .ok();
+            })
+            .detach();
+        });
+    }
+
+    pub fn branch_from_stash(&mut self, _: &BranchFromStash, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_stash(cx) else { return };
+        let Some(root) = self.selected_root(cx) else { return };
+        self.prompt(format!("New branch from stash@{{{index}}}"), "", window, cx, move |this, name, window, cx| {
+            if !ops::is_valid_branch_name(&name) {
+                return this.show_message("New branch", format!("'{name}' is not a valid branch name."), window, cx);
+            }
+            this.op_on(root, "Creating branch", window, cx, move |git, loc| async move {
+                ops::stash_branch(&git, &loc, index, &name).await
+            });
         });
     }
 

@@ -14,7 +14,7 @@ use crate::keymap::{self, *};
 use crate::store::{RepoEntry, RepoStore};
 use crate::text::{Line, age, truncate};
 use crate::theme::{FONT, FONT_SIZE, LINE_HEIGHT, Palette};
-use crate::workspace::{Dialog, MainContent, Panel, ScreenMode, TextKind, View, Workspace};
+use crate::workspace::{Dialog, MainContent, MenuItem, Panel, ScreenMode, TextKind, View, Workspace};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GAP: Pixels = px(10.);
@@ -797,6 +797,7 @@ impl Workspace {
                 self.help_body(scroll, cx),
                 px(640.),
             ),
+            Dialog::Menu { title, items, selected } => (title.to_string(), self.menu_body(items, *selected, cx), px(640.)),
             Dialog::Results { title, rows, scroll, .. } => {
                 // As many rows as fit in the popup (80% of the window) beside its title,
                 // tally and hint lines; the rest scroll.
@@ -823,6 +824,9 @@ impl Workspace {
                 div()
                     .key_context(context)
                     .track_focus(&self.dialog_focus)
+                    .when(matches!(dialog, Dialog::Menu { .. }), |d| {
+                        d.on_key_down(cx.listener(Self::menu_key_down))
+                    })
                     .flex_1()
                     .min_h(px(0.))
                     .child(body),
@@ -855,6 +859,34 @@ impl Workspace {
                 .bg(hsla(0., 0., 0., 0.35))
                 .child(boxed),
         )
+    }
+
+    /// lazygit-style menu: each item's key, then its label; the selected one highlighted.
+    fn menu_body(&self, items: &[MenuItem], selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        let rows = items.iter().enumerate().map(|(ix, item)| {
+            let mut line = Line::new();
+            line.color(format!("{:<3}", item.key), Palette::cyan());
+            line.push(&item.label);
+            div()
+                .id(ix)
+                .h(LINE_HEIGHT)
+                .px(px(4.))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .when(ix == selected, |d| d.bg(Palette::selection()))
+                .child(line.build())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| this.pick_menu_item(ix, window, cx)),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().flex().flex_col().children(rows))
+            .child(div().text_color(Palette::blue()).child("<enter> or the item's key: select · <esc>: cancel"))
+            .into_any_element()
     }
 
     /// One line per repo of a multi-repo action, then a tally.
@@ -1077,6 +1109,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::amend))
             .on_action(cx.listener(Self::discard))
             .on_action(cx.listener(Self::stash_all))
+            .on_action(cx.listener(Self::stash_options))
             .on_action(cx.listener(Self::checkout))
             .on_action(cx.listener(Self::checkout_previous))
             .on_action(cx.listener(Self::new_branch))
@@ -1086,6 +1119,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::stash_apply))
             .on_action(cx.listener(Self::stash_pop))
             .on_action(cx.listener(Self::stash_drop))
+            .on_action(cx.listener(Self::rename_stash))
+            .on_action(cx.listener(Self::branch_from_stash))
             .on_action(cx.listener(Self::confirm_dialog))
             .on_action(cx.listener(Self::close_dialog))
             .child(
@@ -1439,7 +1474,7 @@ fn hints(view: View) -> String {
         View::Branches => &[("Checkout", "<space>"), ("New", "n"), ("Delete", "d"), ("Fast-forward", "f"), ("Upstream", "u")],
         View::Remotes => &[("Checkout", "<space>"), ("New branch", "n"), ("Fetch", "f")],
         View::Tags | View::Commits => &[("Checkout", "<space>"), ("View", "<enter>")],
-        View::Stash => &[("Apply", "<space>"), ("Pop", "g"), ("Drop", "d")],
+        View::Stash => &[("Apply", "<space>"), ("Pop", "g"), ("Drop", "d"), ("Rename", "r"), ("Branch", "n")],
         View::Main => &[("Scroll", "j/k"), ("Back", "<esc>")],
         _ => &[("Push", "P"), ("Pull", "p"), ("Fetch", "f")],
     };
