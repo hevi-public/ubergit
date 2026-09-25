@@ -51,10 +51,10 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 |---|---|
 | Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `R` rescan · `@` toggle command log |
 | Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch all · `U` fast-forward repos that are behind · `o` open in lazygit |
-| Files | `space` stage/unstage · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash |
+| Files | `space` stage/unstage · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
 | Branches | `space` checkout · `n` new · `d` delete · `f` fast-forward · `-` previous branch · `u` set upstream |
 | Remotes / Tags / Commits | `space` checkout · `n` new branch from it |
-| Stash | `space` apply · `g` pop · `d` drop |
+| Stash | `space` apply · `g` pop · `d` drop · `r` rename · `n` new branch from stash |
 
 ## Working across repos
 
