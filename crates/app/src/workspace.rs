@@ -18,6 +18,7 @@ use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstr
 
 use crate::batch::BatchRow;
 use crate::keymap::*;
+use crate::pr::{self, OpenAction};
 use crate::store::RepoStore;
 use crate::theme::LINE_HEIGHT;
 use crate::ui_state::{self, SavedLayout, SavedWindow, UiState, WorkdirState};
@@ -1678,6 +1679,23 @@ impl Workspace {
         let command = self.store.read(cx).config.lazygit_command_for(&root);
         if let Err(err) = std::process::Command::new("sh").arg("-c").arg(&command).spawn() {
             self.show_message("Open in lazygit", format!("{command}\n\n{err}"), window, cx);
+        }
+    }
+
+    /// `G`: the selected repo's PR in the browser, or GitHub's page for opening one, as
+    /// [`pr::open_action`] decides. Marks don't count.
+    pub fn open_pull_request(&mut self, _: &OpenPullRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.selected_root(cx) else { return };
+        let store = self.store.read(cx);
+        let Some(entry) = store.entry(&root) else { return };
+        let summary = entry.summary.as_ref().filter(|_| entry.error.is_none());
+        match pr::open_action(&store.pr_view(entry), summary, pr::remote_repo(entry)) {
+            OpenAction::Open(url) => cx.open_url(&url),
+            OpenAction::Message(message) => self.show_message("Pull request", message, window, cx),
+            OpenAction::LookUp(message) => {
+                self.store.update(cx, |store, cx| store.look_up_pr(&root, cx));
+                self.show_message("Pull request", message, window, cx);
+            }
         }
     }
 

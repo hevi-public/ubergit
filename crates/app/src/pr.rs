@@ -1,13 +1,15 @@
 //! How a repo's pull request reads: the overview's PR column, the badge after the branch in
-//! the Repos panel, and the Status view's rows. All of it goes by [`RepoStore::pr_view`],
-//! so another branch's PR never shows.
+//! the Repos panel, and the Status view's rows; and what `G` opens. All of it goes by
+//! [`RepoStore::pr_view`], so another branch's PR never shows, or opens.
 //!
 //! [`RepoStore::pr_view`]: crate::store::RepoStore::pr_view
 
 use gpui_kit::Hsla;
-use ubergit_core::github::RemoteRepo;
-use ubergit_core::pr_status::{self, GhStatus, LookupError, PrView, Skip};
-use ubergit_core::{Checks, ChecksState, PrState, PullRequest, ReviewDecision, Reviewer, ReviewerState};
+use ubergit_core::github::{self, RemoteRepo};
+use ubergit_core::pr_status::{self, Found, GhStatus, LookupError, PrView, Skip};
+use ubergit_core::{
+    Checks, ChecksState, Head, PrState, PullRequest, RepoSummary, ReviewDecision, Reviewer, ReviewerState, Upstream,
+};
 
 use crate::store::RepoEntry;
 use crate::text::{Line, age, truncate};
@@ -95,16 +97,26 @@ pub fn remote_repo(entry: &RepoEntry) -> Option<&RemoteRepo> {
 }
 
 /// The Status view's rows as (key, value): the PR, its reviews and checks, and when it was
-/// looked up; or one row saying why there's none. Nothing while PR status is off. `width`
-/// is the characters a value has; titles and lists are cut to fit it.
-pub fn status_rows(view: &PrView, remote: Option<&RemoteRepo>, width: usize) -> Vec<(&'static str, Line)> {
+/// looked up; or one row saying why there's none, and whether `G` opens one. Nothing while
+/// PR status is off. `width` is the characters a value has; titles and lists are cut to fit
+/// it.
+pub fn status_rows(
+    view: &PrView,
+    summary: Option<&RepoSummary>,
+    remote: Option<&RemoteRepo>,
+    width: usize,
+) -> Vec<(&'static str, Line)> {
     let mut rows = Vec::new();
     let reason = match view {
         PrView::Off => return rows,
         PrView::Found { found, error } => {
             let Some(pr) = &found.lookup.pr else {
                 let mut none = Line::new();
-                none.color(format!("none  checked {} ago", age(Some(found.checked))), Palette::dim());
+                none.color("none", Palette::dim());
+                if create_url(found, summary).is_some() {
+                    none.color("  (G opens one)", Palette::blue());
+                }
+                none.color(format!("  checked {} ago", age(Some(found.checked))), Palette::dim());
                 if let Some(error) = error {
                     failure(&mut none, error, width);
                 }
@@ -156,6 +168,117 @@ fn skip_reason(skip: Skip, remote: Option<&RemoteRepo>) -> String {
             Some(repo) => format!("not on GitHub ({} isn't a host gh is logged in to)", repo.host),
             None => "not on GitHub".into(),
         },
+    }
+}
+
+/// What `G` does for a repo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenAction {
+    /// Open this `https://` URL in the browser.
+    Open(String),
+    /// There's nothing to open; this says why.
+    Message(String),
+    /// The PR isn't known yet, or looking it up failed: look it up now, and say to press `G`
+    /// again.
+    LookUp(String),
+}
+
+/// What `G` does: open the branch's PR in the browser, or GitHub's page for opening one,
+/// or say why there's neither. It goes by `view`, what the Status view shows, so it never
+/// opens another branch's PR. `summary` is the one [`RepoStore::pr_view`] went by, and
+/// `remote` is [`remote_repo`]'s.
+///
+/// [`RepoStore::pr_view`]: crate::store::RepoStore::pr_view
+pub fn open_action(view: &PrView, summary: Option<&RepoSummary>, remote: Option<&RemoteRepo>) -> OpenAction {
+    let message = |text: &str| OpenAction::Message(text.to_string());
+    match view {
+        PrView::Found { found, .. } => {
+            let (branch, remote_name) = (&found.key.branch, &found.key.remote);
+            match (&found.lookup.pr, create_url(found, summary)) {
+                // Even when a later lookup failed: a PR's URL doesn't change.
+                (Some(pr), _) => open_https(&pr.url),
+                (None, Some(url)) => open_https(url),
+                // The branch isn't on the remote: it went, or it's not pushed yet. Pushing is
+                // left to `P`: opening a page shouldn't change the remote.
+                (None, None) if found.lookup.create_url.is_some() => OpenAction::Message(match summary {
+                    Some(RepoSummary {
+                        head: Head::Branch(local),
+                        upstream: Upstream::Gone { name },
+                        ..
+                    }) => format!("{local}'s upstream {name} is gone from the remote (deleted after merging?)."),
+                    _ => format!("{branch} isn't on {remote_name} yet (or not fetched: f). Push it first (P)."),
+                }),
+                (None, None) => OpenAction::Message(format!(
+                    "No pull request for {branch}, and nothing to open one against: it's GitHub's default \
+                     branch, or the repository has none."
+                )),
+            }
+        }
+        PrView::Skipped(skip) => OpenAction::Message(match skip {
+            Skip::Bare => "A bare repository has no branch checked out.".into(),
+            Skip::Detached => "HEAD is detached: check out a branch first.".into(),
+            Skip::Unborn => "The branch has no commits yet.".into(),
+            Skip::DefaultBranch => on_default_branch(summary),
+            Skip::NoRemote => "This repository has no remote.".into(),
+            Skip::NotOnGitHub => not_on_github(summary, remote),
+        }),
+        // Not read yet, or it can't be (the Status view says why): a lookup would do nothing.
+        PrView::Unknown if summary.is_none() => message("This repository hasn't been read, so its branch isn't known."),
+        PrView::Unknown => OpenAction::LookUp("Looking up the pull request… press G again in a moment.".into()),
+        PrView::Failed(error) => OpenAction::LookUp(format!(
+            "Looking up the pull request failed: {}\n\nTrying again… press G again in a moment.",
+            error.message.lines().next().unwrap_or_default()
+        )),
+        PrView::GhNotInstalled => message("gh isn't installed: brew install gh, then press R."),
+        PrView::GhNotLoggedIn => message("gh isn't logged in: run gh auth login, then press R."),
+        PrView::GhFailed(text) => OpenAction::Message(format!("{text}\n\nR asks gh again.")),
+        PrView::Off => message("PR status is turned off (github_status = false in config.toml)."),
+    }
+}
+
+/// GitHub's page for opening the branch's PR, once the branch is on the remote: before
+/// that, the page has nothing to compare.
+fn create_url<'a>(found: &'a Found, summary: Option<&RepoSummary>) -> Option<&'a str> {
+    let pushed = summary.is_some_and(|s| s.remote_branch_oid.is_some());
+    found.lookup.create_url.as_deref().filter(|_| pushed)
+}
+
+/// Opens only `https://` URLs. A PR's comes from GitHub's answer, and macOS would hand any
+/// other scheme to whatever app claims it.
+fn open_https(url: &str) -> OpenAction {
+    if url.starts_with("https://") {
+        OpenAction::Open(url.to_string())
+    } else {
+        OpenAction::Message(format!("Not opening {url}: only https:// links are opened."))
+    }
+}
+
+/// Why the default branch has no PR to open. A branch started from `origin/main` tracks it,
+/// and so counts as the default branch, until it's pushed under its own name. `P` can't do
+/// that: with `push.default = simple`, git won't push to an upstream of another name.
+fn on_default_branch(summary: Option<&RepoSummary>) -> String {
+    if let Some(s) = summary
+        && let Head::Branch(local) = &s.head
+        && let Upstream::Tracking { name, .. } = &s.upstream
+        && let Some((remote, branch)) = github::remote_branch(Some(name.as_str()), &s.remotes, local)
+        && branch != *local
+    {
+        return format!(
+            "{local} tracks {name}, the default branch: push it to its own branch first (git push -u {remote} {local})."
+        );
+    }
+    "On the default branch: there's no pull request to open.".into()
+}
+
+/// Names the remote, and its host when the URL names an owner/repo there: a GitHub
+/// Enterprise host gh has no login for looks the same as GitLab.
+fn not_on_github(summary: Option<&RepoSummary>, remote: Option<&RemoteRepo>) -> String {
+    // A bare repo is `Skip::Bare` instead, so `bare` is false here.
+    let key = summary.and_then(|s| pr_status::pr_key(s, false).ok());
+    let name = key.as_ref().map_or("The remote", |key| key.remote.as_str());
+    match remote {
+        Some(repo) => format!("{name} is on {}, which isn't a GitHub host gh is logged in to.", repo.host),
+        None => format!("{name}'s URL doesn't name a GitHub repository."),
     }
 }
 
@@ -293,7 +416,8 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
     use ubergit_core::github::PrLookup;
-    use ubergit_core::pr_status::{Found, PrKey};
+    use ubergit_core::pr_status::PrKey;
+    use ubergit_core::{ChangeCounts, DefaultBranch};
 
     fn key() -> PrKey {
         PrKey {
@@ -418,7 +542,7 @@ mod tests {
     }
 
     fn rows(view: PrView, remote: Option<&RemoteRepo>, width: usize) -> Vec<(&'static str, String)> {
-        status_rows(&view, remote, width).into_iter().map(|(key, line)| (key, text(&line))).collect()
+        status_rows(&view, None, remote, width).into_iter().map(|(key, line)| (key, text(&line))).collect()
     }
 
     #[test]
@@ -510,6 +634,172 @@ mod tests {
         assert_eq!(reason(PrView::GhNotLoggedIn, None), one("gh isn't logged in: run gh auth login"));
         assert_eq!(reason(PrView::GhFailed("gh auth status timed out after 30s"), None), one("gh auth status timed out after 30s"));
         assert_eq!(reason(PrView::Off, None), vec![]);
+    }
+
+    const CREATE: &str = "https://github.com/acme/billing/compare/main...acme:feat/tax?expand=1";
+
+    /// On `feat/tax`, which is on `origin` when `pushed`.
+    fn summary(pushed: bool) -> RepoSummary {
+        RepoSummary {
+            head: Head::Branch("feat/tax".into()),
+            head_oid: Some("abc".into()),
+            upstream: if pushed {
+                Upstream::Tracking { name: "origin/feat/tax".into(), ahead: 0, behind: 0 }
+            } else {
+                Upstream::None
+            },
+            upstream_oid: pushed.then(|| "abc".into()),
+            remote_branch_oid: pushed.then(|| "abc".into()),
+            base: None,
+            changes: ChangeCounts::default(),
+            stash_count: 0,
+            op: None,
+            last_fetch: None,
+            remotes: vec!["origin".into()],
+            default_branch: Some(DefaultBranch {
+                full_ref: "refs/remotes/origin/main".into(),
+                short: "origin/main".into(),
+            }),
+            shallow: false,
+        }
+    }
+
+    /// No PR, and GitHub's page for opening one.
+    fn openable() -> Found {
+        let mut found = found(None);
+        found.lookup.create_url = Some(CREATE.into());
+        found
+    }
+
+    #[test]
+    fn the_none_row_says_when_g_opens_one() {
+        let openable = openable();
+        let view = PrView::Found { found: &openable, error: None };
+        let row = |summary: RepoSummary| text(&status_rows(&view, Some(&summary), None, 80)[0].1);
+        assert_eq!(row(summary(true)), "none  (G opens one)  checked 2m ago");
+        // Not pushed: the page would have nothing to compare.
+        assert_eq!(row(summary(false)), "none  checked 2m ago");
+    }
+
+    fn message(text: &str) -> OpenAction {
+        OpenAction::Message(text.into())
+    }
+
+    #[test]
+    fn g_opens_the_pr_or_the_page_to_open_one() {
+        let (pushed, unpushed) = (summary(true), summary(false));
+        let open = |view: PrView, summary: &RepoSummary| open_action(&view, Some(summary), None);
+        let url = "https://github.com/acme/billing/pull/412";
+
+        let with_pr = found(Some(pr(PrState::Open, None, None)));
+        assert_eq!(open(PrView::Found { found: &with_pr, error: None }, &pushed), OpenAction::Open(url.into()));
+        // A later failed lookup doesn't change the PR's URL.
+        let failed = error("timed out");
+        assert_eq!(open(PrView::Found { found: &with_pr, error: Some(&failed) }, &pushed), OpenAction::Open(url.into()));
+        // Its URL comes from GitHub's answer: nothing but https:// opens.
+        let mut odd = pr(PrState::Open, None, None);
+        odd.url = "file:///Applications/Calculator.app".into();
+        let odd = found(Some(odd));
+        assert_eq!(
+            open(PrView::Found { found: &odd, error: None }, &pushed),
+            message("Not opening file:///Applications/Calculator.app: only https:// links are opened.")
+        );
+
+        let openable = openable();
+        let view = PrView::Found { found: &openable, error: None };
+        assert_eq!(open(view, &pushed), OpenAction::Open(CREATE.into()));
+        assert_eq!(
+            open(view, &unpushed),
+            message("feat/tax isn't on origin yet (or not fetched: f). Push it first (P).")
+        );
+        // Its remote branch was deleted, say after its PR merged.
+        let gone = RepoSummary {
+            upstream: Upstream::Gone { name: "origin/feat/tax".into() },
+            ..unpushed.clone()
+        };
+        assert_eq!(
+            open(view, &gone),
+            message("feat/tax's upstream origin/feat/tax is gone from the remote (deleted after merging?).")
+        );
+        let nothing = found(None);
+        assert_eq!(
+            open(PrView::Found { found: &nothing, error: None }, &pushed),
+            message("No pull request for feat/tax, and nothing to open one against: it's GitHub's default branch, or the repository has none.")
+        );
+    }
+
+    #[test]
+    fn g_says_why_a_branch_has_no_pr() {
+        let feat = summary(true);
+        let open = |view: PrView, summary: Option<&RepoSummary>, remote: Option<&RemoteRepo>| open_action(&view, summary, remote);
+        let skipped = |skip| open(PrView::Skipped(skip), Some(&feat), None);
+        assert_eq!(skipped(Skip::Bare), message("A bare repository has no branch checked out."));
+        assert_eq!(skipped(Skip::Detached), message("HEAD is detached: check out a branch first."));
+        assert_eq!(skipped(Skip::Unborn), message("The branch has no commits yet."));
+        assert_eq!(skipped(Skip::NoRemote), message("This repository has no remote."));
+
+        let main = RepoSummary {
+            head: Head::Branch("main".into()),
+            upstream: Upstream::Tracking { name: "origin/main".into(), ahead: 0, behind: 0 },
+            ..summary(true)
+        };
+        let default = message("On the default branch: there's no pull request to open.");
+        assert_eq!(open(PrView::Skipped(Skip::DefaultBranch), Some(&main), None), default);
+        assert_eq!(open(PrView::Skipped(Skip::DefaultBranch), None, None), default);
+        // Started from origin/main, and not pushed under its own name yet.
+        let started = RepoSummary {
+            upstream: Upstream::Tracking { name: "origin/main".into(), ahead: 1, behind: 0 },
+            ..summary(true)
+        };
+        assert_eq!(
+            open(PrView::Skipped(Skip::DefaultBranch), Some(&started), None),
+            message(
+                "feat/tax tracks origin/main, the default branch: push it to its own branch first \
+                 (git push -u origin feat/tax)."
+            )
+        );
+
+        let gitlab = RemoteRepo { host: "gitlab.com".into(), ..remote("acme") };
+        assert_eq!(
+            open(PrView::Skipped(Skip::NotOnGitHub), Some(&feat), Some(&gitlab)),
+            message("origin is on gitlab.com, which isn't a GitHub host gh is logged in to.")
+        );
+        assert_eq!(
+            open(PrView::Skipped(Skip::NotOnGitHub), Some(&feat), None),
+            message("origin's URL doesn't name a GitHub repository.")
+        );
+    }
+
+    #[test]
+    fn g_looks_up_a_pr_that_is_not_known_yet() {
+        let feat = summary(true);
+        let open = |view: PrView, summary: Option<&RepoSummary>| open_action(&view, summary, None);
+        assert_eq!(
+            open(PrView::Unknown, Some(&feat)),
+            OpenAction::LookUp("Looking up the pull request… press G again in a moment.".into())
+        );
+        let failed = error("gh: Something went wrong\nmore");
+        assert_eq!(
+            open(PrView::Failed(&failed), Some(&feat)),
+            OpenAction::LookUp(
+                "Looking up the pull request failed: gh: Something went wrong\n\nTrying again… press G again in a moment.".into()
+            )
+        );
+        // Not read, or can't be: a lookup would have nothing to go on.
+        assert_eq!(open(PrView::Unknown, None), message("This repository hasn't been read, so its branch isn't known."));
+    }
+
+    #[test]
+    fn g_says_what_is_wrong_with_gh() {
+        let feat = summary(true);
+        let open = |view: PrView| open_action(&view, Some(&feat), None);
+        assert_eq!(open(PrView::GhNotInstalled), message("gh isn't installed: brew install gh, then press R."));
+        assert_eq!(open(PrView::GhNotLoggedIn), message("gh isn't logged in: run gh auth login, then press R."));
+        assert_eq!(
+            open(PrView::GhFailed("gh auth status timed out after 30s")),
+            message("gh auth status timed out after 30s\n\nR asks gh again.")
+        );
+        assert_eq!(open(PrView::Off), message("PR status is turned off (github_status = false in config.toml)."));
     }
 
     #[test]

@@ -529,6 +529,13 @@ impl RepoStore {
         }
     }
 
+    /// Looks up one repo's PR now rather than when it's next due, for `G` on a repo whose PR
+    /// isn't known.
+    pub fn look_up_pr(&mut self, root: &Path, cx: &mut Context<Self>) {
+        self.pr_queue.now([root.to_path_buf()]);
+        self.pump_prs(cx);
+    }
+
     /// Queues every repo's PR when a timer round is due; returns the time until the next.
     fn pr_round_if_due(&mut self, cx: &mut Context<Self>) -> Duration {
         let interval = self.config.pr_interval();

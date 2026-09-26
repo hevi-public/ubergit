@@ -713,7 +713,7 @@ impl Workspace {
             kv("Default branch", base);
             // A repo that can't be read says so above; its old branch's PR would mislead.
             if entry.error.is_none() {
-                for (key, value) in pr::status_rows(&store.pr_view(entry), pr::remote_repo(entry), value_width) {
+                for (key, value) in pr::status_rows(&store.pr_view(entry), Some(s), pr::remote_repo(entry), value_width) {
                     kv(key, value);
                 }
             }
@@ -780,18 +780,16 @@ impl Workspace {
             .rev()
             .map(|record| {
                 let mut line = Line::new();
-                // gh runs in the workdir for every repo at once, so its path would say nothing.
-                let name = if record.command.starts_with("gh ") {
-                    "gh".to_string()
-                } else {
-                    store
-                        .repos
-                        .iter()
-                        .find(|r| record.cwd.starts_with(&r.location.root))
-                        .map(|r| r.name().to_string())
-                        .unwrap_or_else(|| record.cwd.display().to_string())
-                };
-                line.color(format!("{name}: "), Palette::cyan());
+                match store.repos.iter().find(|r| record.cwd.starts_with(&r.location.root)) {
+                    Some(repo) => {
+                        line.color(format!("{}: ", repo.name()), Palette::cyan());
+                    }
+                    // gh runs in the workdir for every repo at once: its path would say nothing.
+                    None if record.command.starts_with("gh ") => {}
+                    None => {
+                        line.color(format!("{}: ", record.cwd.display()), Palette::cyan());
+                    }
+                }
                 let color = if record.kind == CmdKind::Network { Palette::blue() } else { Palette::fg() };
                 line.color(&record.command, color);
                 if let Some(err) = &record.error {
@@ -1242,6 +1240,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::fast_forward_all))
             .on_action(cx.listener(Self::open_in_lazygit))
+            .on_action(cx.listener(Self::open_pull_request))
             .on_action(cx.listener(Self::toggle_mark))
             .on_action(cx.listener(Self::toggle_mark_all))
             .on_action(cx.listener(Self::checkout_by_name))
@@ -1634,6 +1633,7 @@ fn hints(view: View) -> String {
             ("Pull", "p"),
             ("Fetch all", "F"),
             ("Update", "U"),
+            ("PR", "G"),
         ],
         View::Files => &[
             ("Stage", "<space>"),
@@ -1656,10 +1656,13 @@ fn hints(view: View) -> String {
         View::Tags | View::Commits => &[("Checkout", "<space>"), ("View", "<enter>")],
         View::Stash => &[("Apply", "<space>"), ("Pop", "g"), ("Drop", "d"), ("Rename", "r"), ("Branch", "n")],
         View::Main => &[("Scroll", "j/k"), ("Back", "<esc>")],
-        _ => &[("Push", "P"), ("Pull", "p"), ("Fetch", "f")],
+        _ => &[("Push", "P"), ("Pull", "p"), ("Fetch", "f"), ("PR", "G")],
     };
     let mut out: Vec<String> = parts.iter().map(|(what, key)| format!("{what}: {key}")).collect();
-    out.push("Repo: {/}".into());
+    // In Repos, j/k already move between repos; the room goes to `G`.
+    if view != View::Repos {
+        out.push("Repo: {/}".into());
+    }
     out.push("Keybindings: ?".into());
     out.join(" | ")
 }
