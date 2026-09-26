@@ -20,6 +20,12 @@ extra panel on the left listing the repos.
 Drag the gaps between panels to resize them: the three columns, the side panels below
 Status, and the main view against the command log.
 
+The layout survives restarts. Panel sizes, the window's size, position and display, the
+screen mode, whether the command log shows, the focused panel, each panel's tab, and each
+workdir's selected repo are saved on quit and every 30 s to
+`~/Library/Application Support/ubergit/state.json`. Delete the file to reset them. If the saved
+display is gone or the window would be off-screen, the window opens centred instead.
+
 ## Run
 
 ```sh
@@ -104,7 +110,8 @@ watcher. It has no UI dependency. `crates/app` holds the GPUI UI and depends on
 
 To check the UI without a person at the keyboard, build with `--features screenshot`. Then set
 `UBERGIT_SCRIPT`, e.g. `wait 2000; keys j 2; shot /tmp/a.png; type msg; key enter; quit`. It
-replays the keystrokes and saves offscreen PNGs of the real Metal-rendered frame.
+replays the keystrokes and saves offscreen PNGs of the real Metal-rendered frame. Scripted runs
+don't read or write `state.json` unless `UBERGIT_STATE` names a state file to use.
 
 Not in v1: staging individual lines or hunks, interactive rebase, cherry-pick, a
 merge-conflict UI, custom patches, a commit graph, and custom keybindings.
