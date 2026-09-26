@@ -323,3 +323,74 @@ pub struct Submodule {
     /// `' '` in sync, `+` checked out at a different commit, `-` not initialised, `U` conflicts.
     pub state: char,
 }
+
+/// The pull request for a branch, as GitHub reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: PrState,
+    /// `None` when the base branch doesn't require reviews.
+    pub review: Option<ReviewDecision>,
+    /// Checks on the PR's head commit; `None` when it has none.
+    pub checks: Option<Checks>,
+    pub reviewers: Vec<Reviewer>,
+    /// The branch it merges into.
+    pub base_ref: String,
+    /// `owner/name` of the repo the PR is on. For a branch pushed to a fork that is
+    /// usually the fork's parent, not the remote's repo.
+    pub base_repo: String,
+    /// The PR's head commit on GitHub, to tell whether local commits are pushed.
+    pub head_oid: String,
+}
+
+/// Closed, unmerged PRs are never reported: the branch counts as having none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+/// CI on a PR's head commit: its check runs and commit statuses together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checks {
+    pub state: ChecksState,
+    /// Names of the checks that failed, in GitHub's order.
+    pub failing: Vec<String>,
+    /// All checks. `failing` and `pending` only look at the first 50.
+    pub total: u32,
+    /// Checks still queued or running.
+    pub pending: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksState {
+    Passing,
+    Failing,
+    Pending,
+}
+
+/// A user or team asked to review, or who has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reviewer {
+    /// Login, or a team's slug.
+    pub name: String,
+    pub state: ReviewerState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewerState {
+    /// Asked to review and hasn't since, or was asked again after reviewing.
+    Requested,
+    Approved,
+    ChangesRequested,
+}
