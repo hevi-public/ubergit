@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::process::CommandExt as _;
+use std::pin::pin;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
@@ -49,22 +50,47 @@ pub(crate) async fn run_bounded(
     let pipe = child.stdin.take();
 
     // Feed stdin while collecting output: a child that writes before it has read all
-    // its input would otherwise deadlock against us once both pipes fill up.
-    let run = future::try_zip(feed(pipe, stdin), child.output());
-    let output = future::or(async { Some(run.await) }, async {
+    // its input would otherwise deadlock against us once both pipes fill up. The timer
+    // covers the write too, so a child that never reads can't hang us.
+    let mut run = pin!(future::try_zip(feed(pipe, stdin), child.output()));
+    // Declared after `run` so it drops first, while `run` still owns the unreaped child
+    // and the group id can't have been reused.
+    let mut group = GroupKill(Some(pid));
+    let output = future::or(async { Some(run.as_mut().await) }, async {
         async_io::Timer::after(timeout).await;
         None
     })
     .await;
 
     match output {
-        Some(result) => result.map(|((), output)| output).map_err(RunError::Io),
-        None => {
+        Some(Ok(((), output))) => {
+            group.disarm();
+            Ok(output)
+        }
+        Some(Err(err)) => Err(RunError::Io(err)),
+        None => Err(RunError::TimedOut),
+    }
+}
+
+/// Kills a child's whole process group when its run is abandoned: on timeout, on an I/O
+/// error, or when the caller drops the future. Dropping the `Child` alone would only kill
+/// the leader, leaving grandchildren like ssh or credential helpers running.
+struct GroupKill(Option<libc::pid_t>);
+
+impl GroupKill {
+    /// The child has exited and been reaped, so its pid may be reused: leave it be.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
             // SAFETY: plain syscall; the child is its own process-group leader (setsid).
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
-            Err(RunError::TimedOut)
         }
     }
 }
@@ -109,6 +135,7 @@ pub(crate) fn first_line(text: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use async_io::block_on;
+    use std::path::Path;
     use std::time::Instant;
 
     fn sh(script: &str) -> std::process::Command {
@@ -133,12 +160,76 @@ mod tests {
         assert_eq!(out.stderr, b"nope\n");
     }
 
+    fn read_pid(path: &Path) -> libc::pid_t {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()) {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no pid in {}", path.display());
+    }
+
+    /// Waits for `pid` to disappear; kills it (so it can't outlive the test) if it doesn't.
+    fn is_gone(pid: libc::pid_t) -> bool {
+        for _ in 0..100 {
+            // SAFETY: plain syscalls on a pid the test started.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        false
+    }
+
+    /// A script whose `sleep` grandchild writes its pid to `pidfile`, then `tail`.
+    fn with_grandchild(pidfile: &Path, tail: &str) -> std::process::Command {
+        sh(&format!("sleep 30 & echo $! > '{}'; {tail}", pidfile.display()))
+    }
+
     #[test]
-    fn times_out() {
+    fn timeout_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
         let started = Instant::now();
-        let result = block_on(run_bounded(sh("sleep 10"), None, Duration::from_millis(200)));
-        assert!(matches!(result, Err(RunError::TimedOut)));
+        let result = block_on(run_bounded(with_grandchild(&pidfile, "wait"), None, Duration::from_millis(300)));
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(is_gone(read_pid(&pidfile)), "grandchild survived the timeout");
+    }
+
+    #[test]
+    fn times_out_while_the_child_ignores_its_input() {
+        let input = vec![b'x'; 1 << 20];
+        let started = Instant::now();
+        let result = block_on(run_bounded(sh("sleep 30"), Some(&input), Duration::from_millis(300)));
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn dropping_the_run_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let run = run_bounded(with_grandchild(&pidfile, "wait"), None, Duration::from_secs(30));
+        // The caller gives up first, e.g. a newer load replaces this one.
+        let finished = block_on(future::or(async { Some(run.await) }, async {
+            async_io::Timer::after(Duration::from_millis(300)).await;
+            None
+        }));
+        assert!(finished.is_none());
+        assert!(is_gone(read_pid(&pidfile)), "grandchild survived the dropped run");
+    }
+
+    #[test]
+    fn runs_in_its_own_session_without_a_terminal() {
+        let out = block_on(run_bounded(sh("echo $$; ps -o pgid= -o tty= -p $$"), None, Duration::from_secs(10))).unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "{text}");
+        assert_eq!(fields[0], fields[1], "not a process-group leader: {text}");
+        assert_eq!(fields[2], "??", "has a terminal: {text}");
     }
 
     #[test]

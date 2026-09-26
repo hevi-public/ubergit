@@ -65,7 +65,8 @@ pub struct GhOutput {
 pub enum GhError {
     #[error("gh is not installed")]
     NotInstalled,
-    /// Exit code 4: no login for the host the command needs.
+    /// No login for the host (exit code 4), or the token was rejected (HTTP 401, e.g. it
+    /// expired or was revoked). Either way the fix is `gh auth login`.
     #[error("gh is not logged in")]
     NotLoggedIn { stderr: String },
     #[error("failed to run gh: {0}")]
@@ -135,7 +136,10 @@ impl Gh {
             .env("NO_COLOR", "1")
             // Terminal-style output would add colour and layout to what we parse.
             .env_remove("GH_FORCE_TTY")
-            .env_remove("CLICOLOR_FORCE");
+            .env_remove("CLICOLOR_FORCE")
+            // Debug logging goes to stderr ahead of the error we show.
+            .env_remove("GH_DEBUG")
+            .env_remove("DEBUG");
 
         let output = match process::run_bounded(std_cmd, cmd.stdin.as_deref(), cmd.timeout).await {
             Ok(output) => output,
@@ -161,6 +165,8 @@ impl Gh {
                 stderr,
             }),
             Some(EXIT_AUTH_REQUIRED) => Err(GhError::NotLoggedIn { stderr }),
+            // e.g. `gh: Bad credentials (HTTP 401)`, exit 1, with no data on stdout.
+            Some(1) if stderr.contains("HTTP 401") => Err(GhError::NotLoggedIn { stderr }),
             code => Err(GhError::Failed {
                 command: cmd.display_args(),
                 code,
@@ -230,6 +236,20 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_token_means_not_logged_in() {
+        let dir = tempfile::tempdir().unwrap();
+        // What gh 2.98 prints for `gh api graphql` with an expired or revoked token.
+        let gh = fake_gh(
+            dir.path(),
+            r#"echo '{"message":"Bad credentials","status":"401"}'; echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1"#,
+        );
+        match block_on(gh.run(GhCommand::new(["api", "graphql"]))) {
+            Err(GhError::NotLoggedIn { stderr }) => assert!(stderr.contains("Bad credentials")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_failure_keeps_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(
@@ -251,6 +271,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = Gh::new(Arc::new(())).with_program(dir.path().join("no-such-gh"));
         let result = block_on(missing.run(GhCommand::new(["--version"])));
+        assert!(matches!(result, Err(GhError::NotInstalled)), "{result:?}");
+        let result = block_on(missing.run(GhCommand::new(["--version"]).cwd(dir.path())));
         assert!(matches!(result, Err(GhError::NotInstalled)), "{result:?}");
 
         let gh = fake_gh(dir.path(), "exit 0");
