@@ -3,12 +3,15 @@
 pub mod config;
 pub mod detail;
 pub mod discovery;
+pub mod gh;
 pub mod git;
 pub mod model;
 pub mod ops;
+mod process;
 pub mod summary;
 pub mod watch;
 
 pub use config::Config;
+pub use gh::{Gh, GhCommand, GhError, GhOutput};
 pub use git::{CmdKind, CommandRecord, CommandSink, Git, GitCommand, GitError, GitOutput};
 pub use model::*;
