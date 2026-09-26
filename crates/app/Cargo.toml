@@ -20,6 +20,7 @@ serde_json.workspace = true
 dirs.workspace = true
 log.workspace = true
 env_logger.workspace = true
+libc.workspace = true
 rlimit.workspace = true
 image = { workspace = true, optional = true }
 
