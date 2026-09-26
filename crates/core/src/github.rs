@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::gh::{Gh, GhCommand, GhError};
 use crate::model::{Checks, ChecksState, PrState, PullRequest, ReviewDecision, Reviewer, ReviewerState};
-use crate::summary::primary_remote;
+use crate::summary::{primary_remote, split_upstream};
 
 /// Repos asked about per GraphQL call, which is also the per-host batch size: a host with
 /// more repos gets several calls, one after another. A call of 40 measured 28,800 nodes
@@ -93,9 +93,10 @@ pub fn parse_remote_url(url: &str) -> Option<RemoteRepo> {
 /// yet, or pushed without setting an upstream). `None` without remotes.
 pub fn remote_branch(upstream: Option<&str>, remotes: &[String], local_branch: &str) -> Option<(String, String)> {
     let remote = primary_remote(remotes, upstream)?;
-    let branch = upstream
-        .and_then(|upstream| upstream.strip_prefix(remote)?.strip_prefix('/'))
-        .unwrap_or(local_branch);
+    let branch = match upstream.and_then(|upstream| split_upstream(remotes, upstream)) {
+        Some((_, branch)) => branch,
+        None => local_branch,
+    };
     Some((remote.to_string(), branch.to_string()))
 }
 
@@ -740,6 +741,10 @@ mod tests {
         assert_eq!(remote_branch(None, &remotes, "local"), pair("origin", "local"));
         // Tracking a local branch: no remote in its name.
         assert_eq!(remote_branch(Some("main"), &remotes, "local"), pair("origin", "local"));
+        // Status's name for the upstream when a local branch is named `origin/fix` too.
+        assert_eq!(remote_branch(Some("remotes/origin/fix"), &remotes, "origin/fix"), pair("origin", "fix"));
+        assert_eq!(remote_branch(Some("remotes/team/x/fix"), &remotes, "local"), pair("team/x", "fix"));
+        assert_eq!(remote_branch(Some("remotes/x"), &["remotes".to_string()], "local"), pair("remotes", "x"));
         assert_eq!(remote_branch(None, &["fork".to_string()], "wip"), pair("fork", "wip"));
         assert_eq!(remote_branch(None, &[], "wip"), None);
         assert_eq!(remote_branch(Some("origin/wip"), &[], "wip"), None);

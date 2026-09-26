@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::git::{CmdKind, Git, GitCommand, parse};
+use crate::github::remote_branch;
 use crate::model::*;
 
 pub async fn summarize(git: &Git, repo: &RepoLocation) -> anyhow::Result<RepoSummary> {
@@ -40,8 +41,8 @@ pub async fn summarize(git: &Git, repo: &RepoLocation) -> anyhow::Result<RepoSum
     };
 
     let remotes = list_remotes(git, &repo.root).await?;
-    let (default_branch, upstream_oid) =
-        default_branch_and_upstream(git, &repo.root, &remotes, status.upstream.as_deref()).await?;
+    let refs = read_refs(git, &repo.root, &remotes, status.upstream.as_deref(), status.branch.as_deref()).await?;
+    let default_branch = refs.default_branch;
     let head = status.head();
 
     let base = match (&default_branch, &head) {
@@ -62,7 +63,8 @@ pub async fn summarize(git: &Git, repo: &RepoLocation) -> anyhow::Result<RepoSum
     Ok(RepoSummary {
         head_oid: status.oid.clone(),
         upstream: status.upstream(),
-        upstream_oid,
+        upstream_oid: refs.upstream_oid,
+        remote_branch_oid: refs.remote_branch_oid,
         changes: status.change_counts(),
         stash_count: status.stash_count,
         head,
@@ -83,15 +85,8 @@ pub async fn list_remotes(git: &Git, cwd: &Path) -> anyhow::Result<Vec<String>> 
 /// Which remote the repo's default branch lives on: the upstream's remote, else
 /// `origin`, else the only/first remote.
 pub fn primary_remote<'a>(remotes: &'a [String], upstream: Option<&str>) -> Option<&'a str> {
-    if let Some(upstream) = upstream {
-        // Remote names may contain '/', so pick the longest remote that prefixes it.
-        let from_upstream = remotes
-            .iter()
-            .filter(|r| upstream.starts_with(&format!("{r}/")))
-            .max_by_key(|r| r.len());
-        if let Some(remote) = from_upstream {
-            return Some(remote);
-        }
+    if let Some((remote, _)) = upstream.and_then(|upstream| split_upstream(remotes, upstream)) {
+        return Some(remote);
     }
     remotes
         .iter()
@@ -100,16 +95,43 @@ pub fn primary_remote<'a>(remotes: &'a [String], upstream: Option<&str>) -> Opti
         .map(String::as_str)
 }
 
+/// The remote and branch name of an upstream on a remote, from status's short name for
+/// it: `origin/feat`, or `remotes/origin/feat` when a local branch is named `origin/feat`
+/// too. `None` for a local upstream.
+pub fn split_upstream<'a, 'u>(remotes: &'a [String], upstream: &'u str) -> Option<(&'a str, &'u str)> {
+    let split = |name: &'u str| {
+        // Remote names may contain '/', so pick the longest remote that prefixes it.
+        remotes
+            .iter()
+            .filter_map(|remote| Some((remote.as_str(), name.strip_prefix(remote.as_str())?.strip_prefix('/')?)))
+            .max_by_key(|(remote, _)| remote.len())
+    };
+    // Git reads `remotes/origin/feat` as `refs/remotes/origin/feat` before it would try a
+    // remote named `remotes`, so the stripped name wins. That still guesses wrong for a
+    // remote named `remotes` whose branch starts with another remote's name, like
+    // `origin/feat` on it: only `branch.<name>.remote` would tell.
+    upstream.strip_prefix("remotes/").and_then(split).or_else(|| split(upstream))
+}
+
+/// What [`read_refs`] finds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refs {
+    pub default_branch: Option<DefaultBranch>,
+    pub upstream_oid: Option<String>,
+    pub remote_branch_oid: Option<String>,
+}
+
 /// Resolves the default branch: `<remote>/HEAD`, else `<remote>/main`, else
 /// `<remote>/master`; with no remote, local `main` then `master`. Also reads the commit
-/// of `upstream` (status's short name for it) in the same `for-each-ref`, as this runs on
-/// every refresh of every repo.
-pub async fn default_branch_and_upstream(
+/// of `upstream` (status's short name for it), and of the remote branch a PR for `branch`
+/// would come from, in the same `for-each-ref`, as this runs on every refresh of every repo.
+pub async fn read_refs(
     git: &Git,
     cwd: &Path,
     remotes: &[String],
     upstream: Option<&str>,
-) -> anyhow::Result<(Option<DefaultBranch>, Option<String>)> {
+    branch: Option<&str>,
+) -> anyhow::Result<Refs> {
     let patterns: Vec<String> = match primary_remote(remotes, upstream) {
         Some(remote) => ["HEAD", "main", "master"]
             .iter()
@@ -118,11 +140,14 @@ pub async fn default_branch_and_upstream(
         None => vec!["refs/heads/main".into(), "refs/heads/master".into()],
     };
     let candidates = upstream.map(upstream_candidates).unwrap_or_default();
+    let remote_branch: Option<String> = branch
+        .and_then(|branch| remote_branch(upstream, remotes, branch))
+        .map(|(remote, branch)| format!("refs/remotes/{remote}/{branch}"));
     let mut args = vec![
         "for-each-ref".to_string(),
         "--format=%(refname)%1f%(symref)%1f%(objectname)%1e".to_string(),
     ];
-    args.extend(patterns.iter().chain(&candidates).cloned());
+    args.extend(patterns.iter().chain(&candidates).chain(&remote_branch).cloned());
     let out = git.read(cwd, args).await?;
     let text = out.stdout_str();
     let refs: Vec<(String, String, String)> = parse::records(&text)
@@ -131,7 +156,11 @@ pub async fn default_branch_and_upstream(
             _ => None,
         })
         .collect();
-    Ok((pick_default_branch(&patterns, &refs), pick_upstream_oid(&candidates, &refs)))
+    Ok(Refs {
+        default_branch: pick_default_branch(&patterns, &refs),
+        upstream_oid: pick_upstream_oid(&candidates, &refs),
+        remote_branch_oid: pick_upstream_oid(remote_branch.as_slice(), &refs),
+    })
 }
 
 /// `refs` are `(refname, symref-target, oid)` triples that exist, `patterns` in priority order.
@@ -157,7 +186,8 @@ pub fn upstream_candidates(short: &str) -> Vec<String> {
         .collect()
 }
 
-/// The commit of the first of [`upstream_candidates`] in `refs`, as in [`pick_default_branch`].
+/// The commit of the first of `candidates` (e.g. [`upstream_candidates`]) in `refs`, as in
+/// [`pick_default_branch`].
 pub fn pick_upstream_oid(candidates: &[String], refs: &[(String, String, String)]) -> Option<String> {
     first_ref(candidates, refs).map(|(_, _, oid)| oid.clone())
 }
@@ -240,9 +270,31 @@ mod tests {
         let remotes = vec!["fork".to_string(), "origin".to_string(), "team/x".to_string()];
         assert_eq!(primary_remote(&remotes, Some("fork/feat")), Some("fork"));
         assert_eq!(primary_remote(&remotes, Some("team/x/feat")), Some("team/x"));
+        // Beside a local branch named `fork/feat`, status calls the upstream this.
+        assert_eq!(primary_remote(&remotes, Some("remotes/fork/feat")), Some("fork"));
+        assert_eq!(primary_remote(&remotes, Some("main")), Some("origin"));
         assert_eq!(primary_remote(&remotes, None), Some("origin"));
         assert_eq!(primary_remote(&["up".to_string()], None), Some("up"));
         assert_eq!(primary_remote(&[], None), None);
+    }
+
+    #[test]
+    fn splits_an_upstream_into_remote_and_branch() {
+        let remotes = vec!["origin".to_string(), "team".to_string(), "team/x".to_string()];
+        let split = |upstream| split_upstream(&remotes, upstream);
+        assert_eq!(split("origin/feat/a"), Some(("origin", "feat/a")));
+        assert_eq!(split("team/x/fix"), Some(("team/x", "fix")));
+        assert_eq!(split("team/fix"), Some(("team", "fix")));
+        assert_eq!(split("remotes/origin/feat"), Some(("origin", "feat")));
+        assert_eq!(split("remotes/team/x/fix"), Some(("team/x", "fix")));
+        // Local upstreams.
+        assert_eq!(split("main"), None);
+        assert_eq!(split("remotes/main"), None);
+        assert_eq!(split("originals/x"), None);
+        // A remote really named `remotes`.
+        let odd = vec!["remotes".to_string(), "origin".to_string()];
+        assert_eq!(split_upstream(&odd, "remotes/x"), Some(("remotes", "x")));
+        assert_eq!(split_upstream(&odd, "remotes/origin/x"), Some(("origin", "x")));
     }
 
     #[test]

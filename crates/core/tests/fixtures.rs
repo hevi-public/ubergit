@@ -79,8 +79,9 @@ fn discovers_every_repo_once() {
         [
             "ahead", "ambiguous-upstream", "bare-clone.git", "bare-repo.git", "behind",
             "detached", "dirty", "diverged", "feature", "gone", "group/nested-svc", "legacy",
-            "local-upstream", "merging", "no-remote", "no-upstream", "rebasing", "shallow",
-            "stashed", "synced", "unborn", "with-submodule", "wt-linked", "wt-main",
+            "local-upstream", "merging", "no-remote", "no-upstream", "pushed-no-upstream",
+            "rebasing", "shallow", "stashed", "synced", "unborn", "with-submodule", "wt-linked",
+            "wt-main",
         ]
     );
     assert!(repo("bare-repo.git").bare);
@@ -166,7 +167,7 @@ fn head_and_upstream_oids_match_git() {
     for name in ["synced", "ahead", "behind", "diverged", "feature", "local-upstream", "ambiguous-upstream"] {
         assert_eq!(resolved(name), (true, true), "{name}");
     }
-    for name in ["no-upstream", "gone", "detached", "bare-clone.git"] {
+    for name in ["no-upstream", "pushed-no-upstream", "gone", "detached", "bare-clone.git"] {
         assert_eq!(resolved(name), (true, false), "{name}");
     }
     for name in ["unborn", "bare-repo.git"] {
@@ -185,6 +186,26 @@ fn local_and_ambiguous_upstreams() {
     assert_eq!(s.upstream, tracking("remotes/origin/main", 0, 0));
     assert_eq!(s.upstream_oid, rev_parse("ambiguous-upstream", "refs/remotes/origin/main"));
     assert_ne!(s.upstream_oid, rev_parse("ambiguous-upstream", "refs/heads/origin/main"));
+}
+
+#[test]
+fn remote_branch_oid_is_the_tip_a_pr_would_come_from() {
+    // With an upstream on a remote, that's the upstream.
+    for name in ["synced", "ahead", "behind", "diverged", "feature", "with-submodule", "ambiguous-upstream"] {
+        let s = summary(name);
+        assert!(s.remote_branch_oid.is_some(), "{name}");
+        assert_eq!(s.remote_branch_oid, s.upstream_oid, "{name}");
+    }
+    // Pushed without -u: no upstream, but the push still moved origin/wip.
+    let s = summary("pushed-no-upstream");
+    assert_eq!(s.upstream, Upstream::None);
+    assert_eq!(s.remote_branch_oid, rev_parse("pushed-no-upstream", "refs/remotes/origin/wip"));
+    assert!(s.remote_branch_oid.is_some());
+    assert_ne!(s.remote_branch_oid, s.head_oid);
+    // Never pushed, deleted on the remote, detached, no remote, or tracking a local branch.
+    for name in ["no-upstream", "gone", "detached", "no-remote", "local-upstream", "unborn"] {
+        assert_eq!(summary(name).remote_branch_oid, None, "{name}");
+    }
 }
 
 #[test]
