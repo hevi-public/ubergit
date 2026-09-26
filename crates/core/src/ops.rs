@@ -66,6 +66,29 @@ pub async fn discard(git: &Git, repo: &RepoLocation, file: &FileEntry) -> Result
     }
 }
 
+/// What [`apply_patch`] does with a patch from [`crate::patch::Patch::build`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchAction {
+    /// Adds the changes to the index.
+    Stage,
+    /// Takes them back out of the index.
+    Unstage,
+    /// Reverts them in the worktree.
+    Discard,
+}
+
+/// `git apply` of a partial patch, reading it from stdin. Whitespace isn't checked: these
+/// are the user's own changes moving between the worktree and the index.
+pub async fn apply_patch(git: &Git, repo: &RepoLocation, patch: Vec<u8>, action: PatchAction) -> Result {
+    let mut args = vec!["apply", "--whitespace=nowarn"];
+    args.extend(match action {
+        PatchAction::Stage => &["--cached"][..],
+        PatchAction::Unstage => &["--cached", "--reverse"],
+        PatchAction::Discard => &["--reverse"],
+    });
+    git.run(GitCommand::new(&repo.root, CmdKind::Write, args).stdin(patch)).await
+}
+
 pub async fn commit(git: &Git, repo: &RepoLocation, message: &str, amend: bool) -> Result {
     let mut args = vec!["commit", "--cleanup=strip", "-F", "-"];
     if amend {

@@ -14,7 +14,7 @@ use crate::keymap::{self, *};
 use crate::store::{RepoEntry, RepoStore};
 use crate::text::{Line, age, truncate};
 use crate::theme::{FONT, FONT_SIZE, LINE_HEIGHT, Palette};
-use crate::workspace::{Dialog, MainContent, MenuItem, Panel, ScreenMode, TextKind, View, Workspace};
+use crate::workspace::{Dialog, DiffHalf, MainContent, MenuItem, Panel, ScreenMode, TextKind, View, Workspace};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GAP: Pixels = px(10.);
@@ -329,7 +329,7 @@ impl Workspace {
                 line.color(format!("{} ", s.index), Palette::dim());
                 line.push(&s.subject);
             }
-            View::Repos | View::Status | View::Main => {}
+            View::Repos | View::Status | View::Main | View::Staging => {}
         }
         line
     }
@@ -448,36 +448,77 @@ impl Workspace {
     fn main_panel(&self, cx: &mut Context<Self>) -> Div {
         let active = self.is_active(Panel::Main);
         match &self.main.content {
-            MainContent::Split { unstaged, staged } => {
-                let unstaged_title = main_title("Unstaged changes", true);
-                let staged_title = main_title("Staged changes", false);
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .gap(GAP)
-                    .child(
-                        self.frame(unstaged_title, active, None, text_list("unstaged", unstaged.clone(), TextKind::Diff, &self.main.scroll))
-                            .flex_1()
-                            .min_h(px(0.)),
-                    )
-                    .child(
-                        self.frame(staged_title, false, None, text_list("staged", staged.clone(), TextKind::Diff, &self.main.scroll2))
-                            .flex_1()
-                            .min_h(px(0.)),
-                    )
+            // Unstaged above staged changes, like lazygit; the half with the staging cursor
+            // gets the active border.
+            MainContent::File { unstaged, staged } => {
+                let staging = self.current_view() == View::Staging;
+                let halves: Vec<(bool, &DiffHalf)> = [(false, unstaged), (true, staged)]
+                    .into_iter()
+                    .filter_map(|(is_staged, half)| Some((is_staged, half.as_ref()?)))
+                    .collect();
+                let mut column = div().size_full().flex().flex_col().gap(GAP);
+                for (ix, (is_staged, half)) in halves.into_iter().enumerate() {
+                    let current = if staging { self.staging.staged == is_staged } else { ix == 0 };
+                    let selection = (staging && current).then(|| self.staging.selection(&half.patch));
+                    let title = main_title(if is_staged { "Staged changes" } else { "Unstaged changes" }, active && current);
+                    let body = self.diff_list(is_staged, half.lines.clone(), selection, active, cx);
+                    column = column.child(self.frame(title, active && current, None, body).flex_1().min_h(px(0.)));
+                }
+                column
             }
             content => {
                 let body = match content {
                     MainContent::Overview => self.overview(cx),
                     MainContent::Status => self.status_view(cx),
                     MainContent::Text { lines, kind } => text_list("main", lines.clone(), *kind, &self.main.scroll),
-                    MainContent::Split { .. } => unreachable!(),
+                    MainContent::File { .. } => unreachable!(),
                 };
                 let title = main_title(&self.main.title, active);
                 self.frame(title, active, None, body).size_full()
             }
         }
+    }
+
+    /// One half of a file's diff, with the staging selection highlighted. Clicking a line
+    /// puts the staging cursor there.
+    fn diff_list(
+        &self,
+        staged: bool,
+        lines: Arc<Vec<String>>,
+        selection: Option<Range<usize>>,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scroll = if staged { &self.main.scroll2 } else { &self.main.scroll };
+        uniform_list(
+            if staged { "staged" } else { "unstaged" },
+            lines.len(),
+            cx.processor(move |_, range: Range<usize>, _window, cx| {
+                range
+                    .map(|ix| {
+                        let selected = selection.as_ref().is_some_and(|s| s.contains(&ix));
+                        div()
+                            .id(ix)
+                            .h(LINE_HEIGHT)
+                            .px(px(4.))
+                            .whitespace_nowrap()
+                            .when(selected, |d| {
+                                d.bg(if active { Palette::selection() } else { Palette::inactive_selection() })
+                            })
+                            .child(diff_line(&lines[ix]).build())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    this.click_diff_line(staged, ix, window, cx)
+                                }),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(scroll)
+        .size_full()
+        .into_any_element()
     }
 
     /// All repos at a glance: the dashboard shown while the Repos panel is focused.
@@ -1131,6 +1172,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::discard))
             .on_action(cx.listener(Self::stash_all))
             .on_action(cx.listener(Self::stash_options))
+            .on_action(cx.listener(Self::toggle_staging_panel))
+            .on_action(cx.listener(Self::toggle_select_hunk))
+            .on_action(cx.listener(Self::toggle_range_select))
+            .on_action(cx.listener(Self::range_select_down))
+            .on_action(cx.listener(Self::range_select_up))
+            .on_action(cx.listener(Self::next_hunk))
+            .on_action(cx.listener(Self::prev_hunk))
             .on_action(cx.listener(Self::checkout))
             .on_action(cx.listener(Self::checkout_previous))
             .on_action(cx.listener(Self::new_branch))
@@ -1491,7 +1539,22 @@ fn hints(view: View) -> String {
             ("Fetch all", "F"),
             ("Update", "U"),
         ],
-        View::Files => &[("Stage", "<space>"), ("Stage all", "a"), ("Commit", "c"), ("Discard", "d"), ("Stash", "s")],
+        View::Files => &[
+            ("Stage", "<space>"),
+            ("Stage lines", "<enter>"),
+            ("Stage all", "a"),
+            ("Commit", "c"),
+            ("Discard", "d"),
+            ("Stash", "s"),
+        ],
+        View::Staging => &[
+            ("Stage/unstage", "<space>"),
+            ("Discard", "d"),
+            ("Hunk/line", "a"),
+            ("Range", "v"),
+            ("Other half", "<tab>"),
+            ("Back", "<esc>"),
+        ],
         View::Branches => &[("Checkout", "<space>"), ("New", "n"), ("Delete", "d"), ("Fast-forward", "f"), ("Upstream", "u")],
         View::Remotes => &[("Checkout", "<space>"), ("New branch", "n"), ("Fetch", "f")],
         View::Tags | View::Commits => &[("Checkout", "<space>"), ("View", "<enter>")],
