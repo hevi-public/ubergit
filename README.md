@@ -6,8 +6,9 @@ for working across many git repositories at once, e.g. a microservice workdir.
 Point it at a directory; it finds every repo underneath and shows their live state:
 branch or detached HEAD, dirty files, ahead/behind upstream, ahead/behind the
 remote's default branch (`origin/HEAD` → `origin/main` / `origin/master`), stashes,
-in-progress rebase/merge, and last fetch. The layout and keys are lazygit's, with one
-extra panel on the left listing the repos.
+in-progress rebase/merge, last fetch, and the branch's pull request with its review and CI
+state (via `gh`). The layout and keys are lazygit's, with one extra panel on the left
+listing the repos.
 
 ```
 [⌘R] Repos │ [1] Status              │ [0] Main: overview / diff / log / patch
@@ -66,7 +67,7 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 
 | Where | Keys |
 |---|---|
-| Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `R` rescan · `@` toggle command log |
+| Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `R` rescan, re-check gh and refresh PR status (no fetch) · `@` toggle command log |
 | Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch all · `U` fast-forward repos that are behind · `o` open in lazygit |
 | Files | `space` stage/unstage · `enter` stage lines · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
 | Staging (`enter` on a file) | `space` stage/unstage the selection · `d` discard it (in staged changes: unstage it) · `a` hunk or line selection · `v` range · `shift-↑`/`shift-↓` extend the range · `h`/`l` or `←`/`→` previous/next hunk · `tab` other half · `c` commit · `esc` back |
@@ -104,6 +105,23 @@ panel then run on every marked repo at once. With nothing marked, they run on th
 Nothing is half-done. Repos that are busy, bare, mid-rebase or mid-merge are skipped with a
 reason, and so are repos with uncommitted changes for `c`, `m` and `U`. The others run in
 parallel, and a popup fills in each repo's result as it finishes.
+
+## Pull requests
+
+Each repo shows the pull request for its checked-out branch, found through the
+[`gh`](https://cli.github.com) CLI. gh must be installed (`brew install gh`) and logged in
+(`gh auth login`). GitHub Enterprise works for every host gh is logged in to, through gh's own
+hosts (`gh auth login --hostname …`). A branch pushed to a fork finds its PR on the parent repo.
+
+- The overview's `PR` column: `#412 approved ✓`. The word is `draft`, `open`, `approved`,
+  `changes` (requested) or `merged`, and the glyph shows the checks passing `✓`, failing `✗` or
+  still running `●`. `-` means no PR, `…` not looked up yet, and `?` a failed lookup.
+- The Repos panel: `#412✓` after the branch, coloured like the overview's word.
+- The Status view (`1`): the title and base branch, who approved, requested changes or was asked
+  to review, which checks failed, and when it was last looked up.
+
+Without gh, or while it isn't logged in, the `PR` column is hidden and the Status view says why.
+`github_status = false` turns PR status off.
 
 ## Config
 

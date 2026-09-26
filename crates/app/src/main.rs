@@ -2,6 +2,7 @@
 
 mod batch;
 mod keymap;
+mod pr;
 mod render;
 mod store;
 mod text;
