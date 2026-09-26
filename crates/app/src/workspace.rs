@@ -1,6 +1,6 @@
 //! The root view: lazygit's panels plus the Repos column, focus, selection and actions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use gpui_kit::base::ResizableState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::{prelude::*, *};
+use serde::{Deserialize, Serialize};
 use ubergit_core::detail::{self, FileDiff, RepoDetail};
 use ubergit_core::ops::StashKind;
 use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstream, ops};
@@ -17,8 +18,10 @@ use crate::batch::BatchRow;
 use crate::keymap::*;
 use crate::store::RepoStore;
 use crate::theme::LINE_HEIGHT;
+use crate::ui_state::{self, SavedLayout, SavedWindow, UiState, WorkdirState};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Panel {
     Repos,
     Status,
@@ -108,7 +111,8 @@ impl View {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScreenMode {
     Normal,
     Half,
@@ -276,18 +280,63 @@ pub struct Workspace {
     pub marked: HashSet<PathBuf>,
     /// Identifies the multi-repo action whose results popup is showing.
     pub(crate) last_batch: u64,
+    /// Where the UI state is saved (`None`: it isn't), and what was saved last.
+    state_path: Option<PathBuf>,
+    last_saved: Option<UiState>,
+    /// The window's placement as of its last move or resize.
+    window_placement: SavedWindow,
+    /// Last session's repo, selected once the first scan finds it.
+    restore_repo: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
+    _autosave: Task<()>,
 }
 
 /// Page size for lists that haven't been laid out yet.
 pub const PAGE: isize = 10;
 
+/// How often the UI state is saved (if it changed), besides on quit.
+const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
 impl Workspace {
-    pub fn new(store: Entity<RepoStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<RepoStore>,
+        saved: UiState,
+        state_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let observe = cx.observe(&store, |this, _, cx| this.on_store_changed(cx));
+        let bounds = cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_placement = SavedWindow::capture(window, cx, Some(&this.window_placement));
+        });
+        let on_quit = cx.on_app_quit(|this, cx| {
+            this.save_state(cx);
+            async {}
+        });
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            this.update(cx, |this, cx| this.save_state(cx)).ok();
+            true
+        });
+        let autosave = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SAVE_INTERVAL).await;
+                if this.update(cx, |this, cx| this.save_state(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        let workdir = store.read(cx).workdir.clone();
+        let restore_repo = saved.workdirs.get(&workdir).and_then(|w| w.selected_repo.clone());
+        let tabs = saved
+            .tabs
+            .iter()
+            .filter(|(panel, tab)| **tab < panel.tabs().len())
+            .map(|(panel, tab)| (*panel, *tab))
+            .collect();
         // Spinner animation while anything is busy.
         let ticker = cx.spawn(async move |this, cx| {
             loop {
@@ -308,14 +357,14 @@ impl Workspace {
             store,
             focus,
             dialog_focus: cx.focus_handle(),
-            focused: Panel::Repos,
-            last_side: Panel::Repos,
-            tabs: HashMap::new(),
+            focused: saved.focused,
+            last_side: if saved.last_side == Panel::Main { Panel::Repos } else { saved.last_side },
+            tabs,
             lists: HashMap::new(),
             filters: HashMap::new(),
             filter: None,
-            screen_mode: ScreenMode::Normal,
-            show_command_log: true,
+            screen_mode: saved.screen_mode,
+            show_command_log: saved.show_command_log,
             main: MainState {
                 key: None,
                 generation: 0,
@@ -329,18 +378,24 @@ impl Workspace {
             spinner: 0,
             layout: {
                 let width = window.viewport_size().width;
+                let sizes = &saved.layout;
                 Layout {
-                    columns: cx.new(|_| ResizableState::default()),
-                    side: cx.new(|_| ResizableState::default()),
-                    main: cx.new(|_| ResizableState::default()),
+                    columns: ui_state::resizable(&sizes.columns, 3, cx),
+                    side: ui_state::resizable(&sizes.side, 4, cx),
+                    main: ui_state::resizable(&sizes.main, 2, cx),
                     repos_width: width * REPOS_SHARE,
                     side_width: width * SIDE_SHARE,
                 }
             },
             marked: HashSet::new(),
             last_batch: 0,
-            _subscriptions: vec![observe],
+            state_path,
+            last_saved: None,
+            window_placement: SavedWindow::capture(window, cx, saved.window.as_ref()),
+            restore_repo,
+            _subscriptions: vec![observe, bounds, on_quit],
             _ticker: ticker,
+            _autosave: autosave,
         }
     }
 
@@ -505,6 +560,16 @@ impl Workspace {
         let store = self.store.read(cx);
         if !store.scanning {
             self.marked.retain(|root| store.index_of(root).is_some());
+            if let Some(root) = self.restore_repo.take()
+                && let Some(position) = self
+                    .visible(View::Repos, store)
+                    .iter()
+                    .position(|&ix| store.repos[ix].location.root == root)
+            {
+                let list = self.list(View::Repos);
+                list.selected = position;
+                list.scroll.scroll_to_item(position, ScrollStrategy::Center);
+            }
         }
         self.after_change(cx);
     }
@@ -516,6 +581,46 @@ impl Workspace {
         self.focused = panel;
         window.focus(&self.focus, cx);
         self.after_change(cx);
+    }
+
+    // ---- saved UI state ---------------------------------------------------------------------
+
+    fn ui_state(&self, cx: &App) -> UiState {
+        let workdir = self.store.read(cx).workdir.clone();
+        // Until the first scan lists the saved repo, keep it rather than saving no selection.
+        let selected_repo = self.restore_repo.clone().or_else(|| self.selected_root(cx));
+        UiState {
+            window: Some(self.window_placement.clone()),
+            layout: SavedLayout {
+                columns: ui_state::sizes(&self.layout.columns, cx),
+                side: ui_state::sizes(&self.layout.side, cx),
+                main: ui_state::sizes(&self.layout.main, cx),
+            },
+            screen_mode: self.screen_mode,
+            show_command_log: self.show_command_log,
+            focused: self.focused,
+            last_side: self.last_side,
+            tabs: Panel::SIDE
+                .into_iter()
+                .filter(|panel| panel.tabs().len() > 1)
+                .map(|panel| (panel, self.tab(panel)))
+                .collect(),
+            workdirs: BTreeMap::from([(workdir, WorkdirState { selected_repo })]),
+            ..UiState::default()
+        }
+    }
+
+    /// Saves the UI state if it changed since the last save.
+    fn save_state(&mut self, cx: &App) {
+        let Some(path) = &self.state_path else { return };
+        let state = self.ui_state(cx);
+        if self.last_saved.as_ref() == Some(&state) {
+            return;
+        }
+        match state.save(path) {
+            Ok(()) => self.last_saved = Some(state),
+            Err(err) => log::warn!("saving {}: {err}", path.display()),
+        }
     }
 
     // ---- main view ---------------------------------------------------------------------

@@ -7363,11 +7363,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "dirs 6.0.0",
  "env_logger",
  "gpui-kit",
  "image",
  "log",
  "rlimit",
+ "serde",
+ "serde_json",
+ "tempfile",
  "ubergit-core",
 ]
 

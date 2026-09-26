@@ -15,7 +15,13 @@ ubergit-core.workspace = true
 gpui-kit.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
 log.workspace = true
 env_logger.workspace = true
 rlimit.workspace = true
 image = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

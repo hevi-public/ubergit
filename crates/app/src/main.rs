@@ -6,6 +6,7 @@ mod render;
 mod store;
 mod text;
 mod theme;
+mod ui_state;
 mod workspace;
 
 #[cfg(feature = "screenshot")]
@@ -18,6 +19,7 @@ use gpui_kit::*;
 use ubergit_core::Config;
 
 use crate::store::RepoStore;
+use crate::ui_state::UiState;
 use crate::workspace::Workspace;
 
 const USAGE: &str = "usage: ubergit [--no-fetch] [WORKDIR]
@@ -132,9 +134,12 @@ fn main() {
 
 fn open_window(workdir: PathBuf, config: Config, cx: &mut App) {
     let title = format!("ubergit — {}", workdir.display());
-    let bounds = Bounds::centered(None, size(px(1600.), px(960.)), cx);
+    let state_path = ui_state::state_path();
+    let saved = state_path.as_deref().map(UiState::load).unwrap_or_default();
+    let (window_bounds, display_id) = ui_state::window_placement(saved.window.as_ref(), cx);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(window_bounds),
+        display_id,
         titlebar: Some(TitlebarOptions {
             title: Some(title.into()),
             ..Default::default()
@@ -145,7 +150,7 @@ fn open_window(workdir: PathBuf, config: Config, cx: &mut App) {
     let window = cx
         .open_window(options, |window, cx| {
             let store = cx.new(|cx| RepoStore::new(workdir, config, cx));
-            let workspace = cx.new(|cx| Workspace::new(store, window, cx));
+            let workspace = cx.new(|cx| Workspace::new(store, saved, state_path, window, cx));
             cx.new(|cx| Root::new(workspace, window, cx))
         })
         .expect("failed to open window");
