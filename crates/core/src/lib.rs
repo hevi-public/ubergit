@@ -9,6 +9,7 @@ pub mod github;
 pub mod model;
 pub mod ops;
 pub mod patch;
+pub mod pr_status;
 mod process;
 pub mod summary;
 pub mod watch;

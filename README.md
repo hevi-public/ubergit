@@ -43,6 +43,16 @@ Options: `--no-fetch` disables background fetching.
 - **Auto-fetch**: every 5 minutes, at most 4 repos at a time. It never prompts: the terminal
   prompt is off and ssh runs with `BatchMode`. Failures show as `fetch failed` on the repo.
 - **Safety-net poll**: every repo's status is recomputed every 60 s.
+- **PR status**: when `gh` is installed and logged in, each branch's pull request and CI
+  status is looked up in the background, 40 repos per GitHub query and one lookup at a
+  time. A repo is looked up again 5 s after its branch, or that branch's commit on the
+  remote, changes (a checkout, a push, a fetch or pull that moved it, a new upstream).
+  Every repo is looked up every 5 minutes (`pr_interval_secs`), which also notices a
+  `gh auth login`, and PRs with checks still running every minute, those alone, for up
+  to half an hour. `R` checks gh again and looks up every repo. Repos on the default
+  branch, detached, bare, without a remote, or whose remote isn't on a host gh is logged
+  in to are never sent to gh. It reads GitHub's API rather than fetching, so
+  `--no-fetch` leaves it on; `github_status = false` turns it off.
 
 Everything goes through the `git` CLI, so your hooks, signing, credential helpers,
 `includeIf` and LFS behave exactly as in a terminal. Background reads use
@@ -105,6 +115,8 @@ max_depth = 3                 # how deep to look for repos
 auto_fetch = true
 fetch_interval_secs = 300
 poll_interval_secs = 60
+github_status = true          # PR and CI status through gh; --no-fetch leaves it on
+pr_interval_secs = 300        # look up every repo's PR again this often (at least 60)
 lazygit_command = "wezterm start --cwd {path} lazygit"   # default: new Terminal.app window
 confirm_quit = true           # q asks first; ⌘Q quits at once. Both ask while git is running
 staging_hunk_mode = true      # the staging view selects hunks first (false: lines); a switches

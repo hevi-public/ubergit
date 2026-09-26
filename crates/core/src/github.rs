@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -189,9 +190,10 @@ pub fn parse_response(stdout: &[u8], targets: &[PrTarget]) -> Result<Vec<Result<
 /// Hosts gh has a working login for. Only ask gh about repos on these hosts: with
 /// `GH_ENTERPRISE_TOKEN` set, gh sends that token to whatever host other than github.com
 /// `--hostname` names, so asking about a remote on, say, a GitLab server would hand it over.
-pub async fn logged_in_hosts(gh: &Gh) -> Result<Vec<String>, GhError> {
+/// `cwd` is only where gh runs (the command log names it), e.g. the workdir.
+pub async fn logged_in_hosts(gh: &Gh, cwd: &Path) -> Result<Vec<String>, GhError> {
     // With --json, gh exits 0 whatever state the logins are in.
-    match gh.run(GhCommand::new(["auth", "status", "--json", "hosts"])).await {
+    match gh.run(GhCommand::new(["auth", "status", "--json", "hosts"]).cwd(cwd)).await {
         Ok(out) => Ok(parse_auth_hosts(&out.stdout).unwrap_or_else(|| vec!["github.com".into()])),
         // An older gh without --json here. github.com never gets the enterprise token.
         Err(GhError::Failed { stderr, .. }) if stderr.contains("unknown flag") => Ok(vec!["github.com".into()]),
@@ -204,8 +206,13 @@ pub async fn logged_in_hosts(gh: &Gh) -> Result<Vec<String>, GhError> {
 /// same repo and branch (two clones, say) are asked about once. Asks
 /// [`MAX_REPOS_PER_QUERY`] repos per call. Only gh missing or not logged in fails the
 /// whole lookup; any other failed call fails just its own repos, so the other calls'
-/// answers still count.
-pub async fn lookup(gh: &Gh, host: &str, targets: &[PrTarget]) -> Result<Vec<Result<PrLookup, String>>, GhError> {
+/// answers still count. gh runs in `cwd`, as in [`logged_in_hosts`].
+pub async fn lookup(
+    gh: &Gh,
+    host: &str,
+    targets: &[PrTarget],
+    cwd: &Path,
+) -> Result<Vec<Result<PrLookup, String>>, GhError> {
     debug_assert!(targets.iter().all(|t| t.repo.host == host));
     let mut unique: Vec<PrTarget> = Vec::new();
     let mut seen: HashMap<(&RemoteRepo, &str), usize> = HashMap::new();
@@ -222,6 +229,7 @@ pub async fn lookup(gh: &Gh, host: &str, targets: &[PrTarget]) -> Result<Vec<Res
     let mut repos = Vec::with_capacity(unique.len());
     for chunk in unique.chunks(MAX_REPOS_PER_QUERY) {
         let cmd = GhCommand::new(["api", "graphql", "--hostname", host, "--input", "-"])
+            .cwd(cwd)
             .stdin(build_query(chunk).to_string());
         let parsed = match gh.run(cmd).await {
             Ok(out) => parse_repos(&out.stdout, chunk.len()),
@@ -1168,15 +1176,16 @@ mod tests {
     fn an_older_gh_without_json_auth_status_means_github_com_only() {
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(dir.path(), "echo 'unknown flag: --json' >&2; exit 1");
-        assert_eq!(block_on(logged_in_hosts(&gh)).unwrap(), vec!["github.com".to_string()]);
+        assert_eq!(block_on(logged_in_hosts(&gh, dir.path())).unwrap(), vec!["github.com".to_string()]);
     }
 
-    /// A stand-in for `gh api graphql` that logs its arguments, its input and how many
-    /// repos it was asked about, and answers that each one exists without PRs.
+    /// A stand-in for `gh api graphql` that logs its arguments, working directory, input
+    /// and how many repos it was asked about, and answers that each one exists without PRs.
     const ANSWER_EVERY_REPO: &str = r#"
 dir=$(dirname "$0")
 body=$(cat)
 echo "$*" >> "$dir/args"
+pwd -P >> "$dir/cwd"
 printf '%s\n' "$body" >> "$dir/bodies"
 n=$(( $(printf '%s' "$body" | grep -o '"n[0-9]*":' | wc -l) ))
 echo "$n" >> "$dir/calls"
@@ -1204,9 +1213,12 @@ printf '}}'
         };
         // The third is a second clone on the same branch.
         let targets = [on_ghe("a", None), on_ghe("b", None), on_ghe("a", Some("abc"))];
-        let results = block_on(lookup(&gh, "ghe.example.com", &targets)).unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let results = block_on(lookup(&gh, "ghe.example.com", &targets, workdir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "args"), "api graphql --hostname ghe.example.com --input -\n");
+        let cwd = workdir.path().canonicalize().unwrap();
+        assert_eq!(read(dir.path(), "cwd"), format!("{}\n", cwd.display()));
         let body: Value = serde_json::from_str(&read(dir.path(), "bodies")).unwrap();
         assert_eq!(body, build_query(&targets[..2]));
         let create = |branch: &str| {
@@ -1223,7 +1235,7 @@ printf '}}'
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(dir.path(), ANSWER_EVERY_REPO);
         let targets: Vec<PrTarget> = (0..85).map(|i| target("o", "r", &format!("b{i}"), None)).collect();
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "calls"), "40\n40\n5\n");
         assert_eq!(results.len(), 85);
@@ -1241,7 +1253,7 @@ printf '}}'
              echo \"gh: Could not resolve to a Repository with the name 'hevi-public/does-not-exist-xyz'.\" >&2\nexit 1"
         );
         let gh = fake_gh(dir.path(), &script);
-        let results = block_on(lookup(&gh, "github.com", &partial_failure_targets(MERGED_TIP))).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &partial_failure_targets(MERGED_TIP), dir.path())).unwrap();
         assert_eq!(results[0].as_ref().unwrap().pr.as_ref().map(|pr| pr.number), Some(15));
         assert!(results[1].as_ref().unwrap_err().starts_with("Could not resolve"));
     }
@@ -1252,22 +1264,22 @@ printf '}}'
         let targets = [target("o", "r", "b", None)];
 
         let gh = fake_gh(dir.path(), "cat >/dev/null; echo 'gh auth login' >&2; exit 4");
-        let result = block_on(lookup(&gh, "github.com", &targets));
+        let result = block_on(lookup(&gh, "github.com", &targets, dir.path()));
         assert!(matches!(result, Err(GhError::NotLoggedIn { .. })), "{result:?}");
         // Nothing to ask, so gh doesn't run.
-        assert_eq!(block_on(lookup(&gh, "github.com", &[])).unwrap(), vec![]);
+        assert_eq!(block_on(lookup(&gh, "github.com", &[], dir.path())).unwrap(), vec![]);
 
         // Any other failure is the repos'.
         let gh = fake_gh(
             dir.path(),
             r#"cat >/dev/null; echo '{"errors":[{"message":"Something went wrong"}]}'; echo 'gh: Something went wrong' >&2; exit 1"#,
         );
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
         assert_eq!(results, vec![Err("gh: Something went wrong".into())]);
 
         // gh succeeded, but that isn't an answer.
         let gh = fake_gh(dir.path(), "cat >/dev/null; echo 'not json'");
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
         assert!(results[0].as_ref().unwrap_err().starts_with("unexpected answer from GitHub"));
     }
 
@@ -1281,7 +1293,7 @@ printf '}}'
         );
         let gh = fake_gh(dir.path(), &script);
         let targets: Vec<PrTarget> = (0..45).map(|i| target("o", "r", &format!("b{i}"), None)).collect();
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "calls"), "40\n");
         assert!(results[..40].iter().all(|result| result.as_ref().is_ok_and(|found| found.pr.is_none())));

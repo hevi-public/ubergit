@@ -1322,6 +1322,7 @@ impl Workspace {
         self.store.update(cx, |store, cx| {
             store.scan(cx);
             store.load_detail(cx);
+            store.refresh_prs(cx);
         });
     }
 
