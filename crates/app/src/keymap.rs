@@ -67,6 +67,14 @@ actions!(
         Discard,
         StashAll,
         StashOptions,
+        // staging view (the main view on a file's diff)
+        ToggleStagingPanel,
+        ToggleRangeSelect,
+        ToggleSelectHunk,
+        RangeSelectDown,
+        RangeSelectUp,
+        PrevHunk,
+        NextHunk,
         // branches
         Checkout,
         CheckoutPrevious,
@@ -178,6 +186,22 @@ keymap! {
     "shift-s", "Files" => StashOptions, "Stash options (keep index, tracked only, staged only)";
 
     // Branches, remote branches, tags
+    // Staging: the main view on a file's diff (`enter` in Files).
+    "space", "Staging" => ToggleStage, "Stage / unstage the selected lines or hunk";
+    "d", "Staging" => Discard, "Discard the selection (in staged changes: unstage it)";
+    "tab", "Staging" => ToggleStagingPanel, "Switch between unstaged and staged changes";
+    "a", "Staging" => ToggleSelectHunk, "Toggle hunk / line selection";
+    "v", "Staging" => ToggleRangeSelect, "Toggle range select";
+    "shift-down", "Staging" => RangeSelectDown, "Extend the range down";
+    "shift-up", "Staging" => RangeSelectUp, "Extend the range up";
+    "h", "Staging" => PrevHunk, "Previous hunk";
+    "l", "Staging" => NextHunk, "Next hunk";
+    "left", "Staging" => PrevHunk, "";
+    "right", "Staging" => NextHunk, "";
+    "c", "Staging" => Commit, "Commit";
+    "shift-a", "Staging" => Amend, "Amend last commit";
+    "escape", "Staging" => Back, "Cancel the range / back to files";
+
     "space", "Branches" => Checkout, "Checkout";
     "n", "Branches" => NewBranch, "New branch";
     "d", "Branches" => DeleteBranch, "Delete branch";
@@ -220,12 +244,11 @@ keymap! {
     ",", "Popup" => PageUp, "";
 }
 
-/// lazygit-style key label, e.g. `shift-j` → `J`, `ctrl-d` → `<c-d>`, `cmd-r` → `⌘R`.
+/// lazygit-style key label, e.g. `shift-j` → `J`, `shift-down` → `<s-down>`,
+/// `ctrl-d` → `<c-d>`, `cmd-r` → `⌘R`.
 pub fn display_key(key: &str) -> String {
-    if let Some(letter) = key.strip_prefix("shift-")
-        && letter.len() == 1
-    {
-        return letter.to_uppercase();
+    if let Some(rest) = key.strip_prefix("shift-") {
+        return if rest.len() == 1 { rest.to_uppercase() } else { format!("<s-{rest}>") };
     }
     if let Some(rest) = key.strip_prefix("ctrl-") {
         return format!("<c-{rest}>");

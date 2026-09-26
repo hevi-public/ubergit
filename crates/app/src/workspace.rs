@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,8 @@ use gpui_kit::base::ResizableState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::{prelude::*, *};
 use ubergit_core::detail::{self, FileDiff, RepoDetail};
-use ubergit_core::ops::StashKind;
+use ubergit_core::ops::{PatchAction, StashKind};
+use ubergit_core::patch::Patch;
 use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstream, ops};
 
 use crate::batch::BatchRow;
@@ -78,6 +80,8 @@ pub enum View {
     Reflog,
     Stash,
     Main,
+    /// The main view on a file's diff, with a cursor for staging lines (`enter` in Files).
+    Staging,
 }
 
 impl View {
@@ -95,11 +99,12 @@ impl View {
             View::Reflog => "Reflog",
             View::Stash => "Stash",
             View::Main => "Main",
+            View::Staging => "Staging",
         }
     }
 
     pub fn is_list(self) -> bool {
-        !matches!(self, View::Status | View::Main)
+        !matches!(self, View::Status | View::Main | View::Staging)
     }
 
     /// Lists that belong to the selected repo (reset when switching repos).
@@ -154,12 +159,42 @@ pub enum TextKind {
     Plain,
 }
 
+/// One half of a file's diff in the main view: its unstaged or its staged changes.
+#[derive(Clone)]
+pub struct DiffHalf {
+    pub lines: Arc<Vec<String>>,
+    pub patch: Arc<Patch>,
+}
+
+impl DiffHalf {
+    fn new(diff: &[u8]) -> Self {
+        Self {
+            lines: Arc::new(detail::to_lines(&String::from_utf8_lossy(diff))),
+            patch: Arc::new(Patch::parse(diff)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum MainContent {
     Overview,
     Status,
     Text { lines: Arc<Vec<String>>, kind: TextKind },
-    Split { unstaged: Arc<Vec<String>>, staged: Arc<Vec<String>> },
+    /// A changed file: its unstaged and staged changes, whichever it has.
+    File { unstaged: Option<DiffHalf>, staged: Option<DiffHalf> },
+}
+
+impl MainContent {
+    pub fn half(&self, staged: bool) -> Option<&DiffHalf> {
+        match self {
+            MainContent::File { unstaged, staged: s } => if staged { s.as_ref() } else { unstaged.as_ref() },
+            _ => None,
+        }
+    }
+
+    fn has_changes(&self, staged: bool) -> bool {
+        self.half(staged).is_some_and(|half| half.patch.has_changes())
+    }
 }
 
 pub struct MainState {
@@ -167,9 +202,45 @@ pub struct MainState {
     generation: u64,
     pub title: SharedString,
     pub content: MainContent,
+    /// The key `content` was loaded for; it lags `key` while the new content loads.
+    loaded: Option<MainKey>,
+    /// Counts loads, so a load can tell whether it started after a patch was applied.
+    loads: u64,
+    /// The unstaged changes, or the whole view when it isn't split.
     pub scroll: UniformListScrollHandle,
+    /// The staged changes.
     pub scroll2: UniformListScrollHandle,
     task: Option<Task<()>>,
+}
+
+/// The staging view's cursor, while the main view shows the diff of the file selected in
+/// Files and has the focus.
+#[derive(Clone, Debug, Default)]
+pub struct Staging {
+    /// The file being staged; `None` when the staging view isn't open.
+    pub path: Option<String>,
+    /// In the staged changes, rather than the unstaged ones.
+    pub staged: bool,
+    /// A line of the diff, always a changed one.
+    pub cursor: usize,
+    /// Where a range selection (`v`) started.
+    pub anchor: Option<usize>,
+    /// Select the block of changes around the cursor (`a`), not just its line.
+    pub hunk: bool,
+    /// Set while a patch is applied, then to the first load that will show its result:
+    /// until that lands, the diff on screen is out of date and keys that change it wait.
+    pending: Option<u64>,
+}
+
+impl Staging {
+    /// The selected lines: the range, else the hunk or the line at the cursor.
+    pub fn selection(&self, patch: &Patch) -> Range<usize> {
+        match self.anchor {
+            Some(anchor) => anchor.min(self.cursor)..anchor.max(self.cursor) + 1,
+            None if self.hunk => patch.block(self.cursor).unwrap_or(self.cursor..self.cursor + 1),
+            None => self.cursor..self.cursor + 1,
+        }
+    }
 }
 
 pub type ConfirmFn = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
@@ -269,6 +340,7 @@ pub struct Workspace {
     pub screen_mode: ScreenMode,
     pub show_command_log: bool,
     pub main: MainState,
+    pub staging: Staging,
     pub dialog: Option<Dialog>,
     pub spinner: usize,
     pub layout: Layout,
@@ -321,10 +393,13 @@ impl Workspace {
                 generation: 0,
                 title: "".into(),
                 content: MainContent::Overview,
+                loaded: None,
+                loads: 0,
                 scroll: UniformListScrollHandle::new(),
                 scroll2: UniformListScrollHandle::new(),
                 task: None,
             },
+            staging: Staging::default(),
             dialog: None,
             spinner: 0,
             layout: {
@@ -368,7 +443,11 @@ impl Workspace {
     }
 
     pub fn current_view(&self) -> View {
-        self.view_of(self.focused)
+        if self.focused == Panel::Main && self.staging.path.is_some() {
+            View::Staging
+        } else {
+            self.view_of(self.focused)
+        }
     }
 
     /// The side panel whose selection drives the main view.
@@ -395,7 +474,7 @@ impl Workspace {
             View::Commits => detail.commits.len(),
             View::Reflog => detail.reflog.len(),
             View::Stash => detail.stashes.len(),
-            View::Status | View::Main => 0,
+            View::Status | View::Main | View::Staging => 0,
         }
     }
 
@@ -488,6 +567,9 @@ impl Workspace {
     pub fn after_change(&mut self, cx: &mut Context<Self>) {
         let root = self.selected_root(cx);
         if self.store.read(cx).selected != root {
+            if self.staging.path.take().is_some() {
+                self.focused = self.last_side;
+            }
             for (view, list) in self.lists.iter_mut() {
                 if view.is_repo_detail() {
                     list.selected = 0;
@@ -506,16 +588,19 @@ impl Workspace {
         if !store.scanning {
             self.marked.retain(|root| store.index_of(root).is_some());
         }
+        self.follow_staged_file(cx);
         self.after_change(cx);
     }
 
     fn focus_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
         if panel != Panel::Main {
             self.last_side = panel;
+            self.staging = Staging::default();
         }
         self.focused = panel;
         window.focus(&self.focus, cx);
         self.after_change(cx);
+        self.fix_staging(false, cx);
     }
 
     // ---- main view ---------------------------------------------------------------------
@@ -586,7 +671,7 @@ impl Workspace {
                 let text = format!("Submodule: {}\nCommit:    {}\nState:     {state}", sm.path, sm.short_oid);
                 (MainKey::Message(text), "Submodule".into())
             }
-            View::Repos | View::Status | View::Main => (MainKey::Overview, "".into()),
+            View::Repos | View::Status | View::Main | View::Staging => (MainKey::Overview, "".into()),
         }
     }
 
@@ -605,14 +690,6 @@ impl Workspace {
             scroll_to_edge(&self.main.scroll, false);
             scroll_to_edge(&self.main.scroll2, false);
         }
-        let location = store.selected_entry().map(|e| e.location.clone());
-        let file = match &key {
-            MainKey::Diff { path, .. } => store
-                .selected_detail()
-                .and_then(|d| d.files.iter().find(|f| &f.path == path).cloned()),
-            _ => None,
-        };
-        let git = store.git.clone();
         match key.clone() {
             MainKey::Overview => self.main.content = MainContent::Overview,
             MainKey::Status => self.main.content = MainContent::Status,
@@ -623,20 +700,43 @@ impl Workspace {
                 }
             }
             MainKey::Diff { .. } | MainKey::Show { .. } | MainKey::Stash { .. } | MainKey::Log { .. } => {
-                let Some(location) = location else { return };
-                let load = cx.background_spawn(load_main(git, location, key.clone(), file));
-                self.main.task = Some(cx.spawn(async move |this, cx| {
-                    let content = load.await;
-                    this.update(cx, |this, cx| {
-                        if this.main.key.as_ref() == Some(&key) {
-                            this.main.content = content;
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                }));
+                return self.start_load(key, cx);
             }
         }
+        self.main.loaded = Some(key);
+        self.fix_staging(false, cx);
+    }
+
+    /// Loads the main view's content for `key` in the background, replacing any load still
+    /// running.
+    fn start_load(&mut self, key: MainKey, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let Some(location) = store.selected_entry().map(|e| e.location.clone()) else { return };
+        let file = match &key {
+            MainKey::Diff { path, .. } => store
+                .selected_detail()
+                .and_then(|d| d.files.iter().find(|f| &f.path == path).cloned()),
+            _ => None,
+        };
+        let load = cx.background_spawn(load_main(store.git.clone(), location, key.clone(), file));
+        self.main.loads += 1;
+        let id = self.main.loads;
+        self.main.task = Some(cx.spawn(async move |this, cx| {
+            let content = load.await;
+            this.update(cx, |this, cx| {
+                if this.main.key.as_ref() == Some(&key) {
+                    this.main.content = content;
+                    this.main.loaded = Some(key);
+                    let applied = this.staging.pending.is_some_and(|first| id >= first);
+                    if applied {
+                        this.staging.pending = None;
+                    }
+                    this.fix_staging(applied, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Scrolls the main view (both halves of a staged/unstaged split) by `lines`.
@@ -650,6 +750,246 @@ impl Workspace {
         scroll_to_edge(&self.main.scroll, bottom);
         scroll_to_edge(&self.main.scroll2, bottom);
         cx.notify();
+    }
+
+    // ---- staging view ----------------------------------------------------------------------
+
+    fn staging_scroll(&self, staged: bool) -> &UniformListScrollHandle {
+        if staged { &self.main.scroll2 } else { &self.main.scroll }
+    }
+
+    /// The diff the staging cursor is in.
+    fn staging_patch(&self) -> Option<Arc<Patch>> {
+        self.staging.path.as_ref()?;
+        Some(self.main.content.half(self.staging.staged)?.patch.clone())
+    }
+
+    /// Opens the staging view, or keeps it right after the diff reloads. Like lazygit, the
+    /// cursor keeps its line if that's still a change, else it moves to the next one; when
+    /// one half has nothing left, it moves to the other. The view closes when neither has
+    /// anything to stage (a binary file just scrolls), back to Files if staging emptied it.
+    fn fix_staging(&mut self, applied: bool, cx: &mut Context<Self>) {
+        if self.focused != Panel::Main {
+            return;
+        }
+        let Some(MainKey::Diff { path, .. }) = self.main.key.clone() else {
+            self.staging = Staging::default();
+            return;
+        };
+        if self.main.loaded != self.main.key {
+            return; // Until the diff for this file arrives.
+        }
+        let content = &self.main.content;
+        let (unstaged, staged) = (content.has_changes(false), content.has_changes(true));
+        if !unstaged && !staged {
+            let was_open = self.staging.path.is_some();
+            self.staging = Staging::default();
+            if applied && was_open {
+                self.focused = self.last_side;
+            }
+            return;
+        }
+        if self.staging.path.as_deref() != Some(path.as_str()) {
+            let hunk = self.store.read(cx).config.staging_hunk_mode;
+            self.staging = Staging { path: Some(path), staged: !unstaged, hunk, ..Staging::default() };
+        } else if !content.has_changes(self.staging.staged) {
+            self.staging.staged = !self.staging.staged;
+            self.staging.cursor = 0;
+            self.staging.anchor = None;
+        }
+        let Some(patch) = self.staging_patch() else { return };
+        self.staging.cursor = patch.nearest_change(self.staging.cursor).unwrap_or(0);
+        if self.staging.anchor.is_some_and(|anchor| anchor >= patch.len()) {
+            self.staging.anchor = None;
+        }
+        self.staging_scroll(self.staging.staged)
+            .scroll_to_item(self.staging.cursor, ScrollStrategy::Nearest);
+    }
+
+    /// Keeps Files on the file being staged when its place in the list changes (a partly
+    /// staged untracked file moves up to the tracked ones), and closes the staging view
+    /// when the file has no changes left.
+    fn follow_staged_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.staging.path.clone() else { return };
+        let store = self.store.read(cx);
+        let Some(detail) = store.selected_detail() else { return };
+        let visible = self.visible(View::Files, store);
+        match visible.iter().position(|&ix| detail.files[ix].path == path) {
+            Some(position) => {
+                let list = self.list(View::Files);
+                if list.selected != position {
+                    list.selected = position;
+                    list.scroll.scroll_to_item(position, ScrollStrategy::Nearest);
+                }
+            }
+            None => {
+                self.staging = Staging::default();
+                self.focused = self.last_side;
+            }
+        }
+    }
+
+    /// Moves the staging cursor to the line `to` picks, if any, and scrolls it into view.
+    /// With `extend`, the move extends a range selection (starting one if needed).
+    fn move_staging(&mut self, extend: bool, to: impl FnOnce(&Patch, usize) -> Option<usize>, cx: &mut Context<Self>) {
+        let Some(patch) = self.staging_patch() else { return };
+        if extend && self.staging.anchor.is_none() {
+            self.staging.anchor = Some(self.staging.cursor);
+            self.staging.hunk = false;
+        }
+        let Some(line) = to(&patch, self.staging.cursor) else { return };
+        self.staging.cursor = line;
+        let shown = match self.staging.anchor {
+            Some(_) => line..line + 1,
+            None => self.staging.selection(&patch),
+        };
+        reveal(self.staging_scroll(self.staging.staged), shown);
+        cx.notify();
+    }
+
+    /// `j`/`k`: the next line, or the next hunk in hunk mode.
+    fn step_staging(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let by_hunk = self.staging.hunk && self.staging.anchor.is_none();
+        self.move_staging(
+            false,
+            |patch, cursor| {
+                if by_hunk { patch.adjacent_block(cursor, forward) } else { patch.adjacent_change(cursor, forward) }
+            },
+            cx,
+        );
+    }
+
+    /// `.`/`,`: the change nearest a page away.
+    fn page_staging(&mut self, pages: isize, cx: &mut Context<Self>) {
+        let rows = visible_rows(self.staging_scroll(self.staging.staged)) - 1;
+        self.move_staging(
+            false,
+            |patch, cursor| {
+                let target = cursor.saturating_add_signed(pages * rows.max(1));
+                if pages > 0 {
+                    patch.nearest_change(target)
+                } else {
+                    patch.adjacent_change(target + 1, false).or(patch.first_change())
+                }
+            },
+            cx,
+        );
+    }
+
+    pub fn toggle_staging_panel(&mut self, _: &ToggleStagingPanel, _: &mut Window, cx: &mut Context<Self>) {
+        let other = !self.staging.staged;
+        if self.staging.path.is_none() || !self.main.content.has_changes(other) {
+            return;
+        }
+        self.staging.staged = other;
+        self.staging.cursor = 0;
+        self.staging.anchor = None;
+        self.fix_staging(false, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_select_hunk(&mut self, _: &ToggleSelectHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.staging.hunk = !self.staging.hunk;
+        self.staging.anchor = None;
+        cx.notify();
+    }
+
+    pub fn toggle_range_select(&mut self, _: &ToggleRangeSelect, _: &mut Window, cx: &mut Context<Self>) {
+        self.staging.anchor = match self.staging.anchor {
+            Some(_) => None,
+            None => Some(self.staging.cursor),
+        };
+        self.staging.hunk = false;
+        cx.notify();
+    }
+
+    pub fn range_select_down(&mut self, _: &RangeSelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_staging(true, |patch, cursor| patch.adjacent_change(cursor, true), cx);
+    }
+
+    pub fn range_select_up(&mut self, _: &RangeSelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_staging(true, |patch, cursor| patch.adjacent_change(cursor, false), cx);
+    }
+
+    pub fn next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.staging.anchor = None;
+        self.move_staging(false, |patch, cursor| patch.adjacent_block(cursor, true), cx);
+    }
+
+    pub fn prev_hunk(&mut self, _: &PrevHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.staging.anchor = None;
+        self.move_staging(false, |patch, cursor| patch.adjacent_block(cursor, false), cx);
+    }
+
+    /// A click on a line of a file's diff: focuses the staging view with the cursor there.
+    pub fn click_diff_line(&mut self, staged: bool, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focused != Panel::Main {
+            self.focus_panel(Panel::Main, window, cx);
+        }
+        let Some(patch) = self.main.content.half(staged).map(|half| half.patch.clone()) else { return };
+        if self.staging.path.is_none() || !patch.has_changes() {
+            return;
+        }
+        self.staging.staged = staged;
+        self.staging.anchor = None;
+        self.staging.cursor = patch.nearest_change(line).unwrap_or(0);
+        cx.notify();
+    }
+
+    /// The staging view's selection as a patch for `action`, unless there's nothing to
+    /// apply (or the diff on screen is about to change).
+    fn build_selection(&mut self, action: PatchAction, window: &mut Window, cx: &mut Context<Self>) -> Option<Vec<u8>> {
+        if self.staging.pending.is_some() {
+            return None;
+        }
+        let patch = self.staging_patch()?;
+        match patch.build(self.staging.selection(&patch), action != PatchAction::Stage) {
+            Ok(built) => built,
+            Err(err) => {
+                self.show_message("Staging", err.to_string(), window, cx);
+                None
+            }
+        }
+    }
+
+    /// Stages the staging view's selection from the unstaged changes, or unstages it from
+    /// the staged ones.
+    fn apply_selection(&mut self, action: PatchAction, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(built) = self.build_selection(action, window, cx) {
+            self.apply_built(built, action, window, cx);
+        }
+    }
+
+    fn apply_built(&mut self, built: Vec<u8>, action: PatchAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.selected_root(cx) else { return };
+        let label = match action {
+            PatchAction::Stage => "Staging",
+            PatchAction::Unstage => "Unstaging",
+            PatchAction::Discard => "Discarding",
+        };
+        self.staging.pending = Some(u64::MAX);
+        self.staging.anchor = None;
+        let task = self.store.update(cx, |store, cx| {
+            store.run_op(&root, label, move |git, loc| async move { ops::apply_patch(&git, &loc, built, action).await }, cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                // Reload the diff now rather than wait for the file list to catch up.
+                Ok(_) => {
+                    this.staging.pending = Some(this.main.loads + 1);
+                    if let Some(key) = this.main.key.clone() {
+                        this.start_load(key, cx);
+                    }
+                }
+                Err(err) => {
+                    this.staging.pending = None;
+                    this.show_error(label, &err, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- navigation actions ----------------------------------------------------------------
@@ -734,6 +1074,7 @@ impl Workspace {
         }
         match self.current_view() {
             View::Main => self.scroll_main(delta, cx),
+            View::Staging => self.step_staging(delta > 0, cx),
             View::Status => {}
             view => self.move_by(view, delta, cx),
         }
@@ -741,6 +1082,9 @@ impl Workspace {
 
     /// `.`/`,`: a page is what fits in the view being moved, less one line of overlap.
     fn page(&mut self, pages: isize, cx: &mut Context<Self>) {
+        if self.popup_scroll().is_none() && self.current_view() == View::Staging {
+            return self.page_staging(pages, cx);
+        }
         let rows = match self.popup_scroll() {
             Some(Some(scroll)) => visible_rows(scroll),
             Some(None) => return,
@@ -766,6 +1110,7 @@ impl Workspace {
     pub fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
         match self.current_view() {
             View::Main => self.scroll_main_to_edge(false, cx),
+            View::Staging => self.move_staging(false, |patch, _| patch.first_change(), cx),
             view if view.is_list() => self.move_cursor(view, |_, _| 0, cx),
             _ => {}
         }
@@ -773,6 +1118,7 @@ impl Workspace {
     pub fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
         match self.current_view() {
             View::Main => self.scroll_main_to_edge(true, cx),
+            View::Staging => self.move_staging(false, |patch, _| patch.adjacent_change(patch.len(), false), cx),
             view if view.is_list() => self.move_cursor(view, |_, len| len - 1, cx),
             _ => {}
         }
@@ -794,13 +1140,16 @@ impl Workspace {
         match self.focused {
             Panel::Repos => self.focus_panel(Panel::Files, window, cx),
             Panel::Status | Panel::Main => {}
+            // From Files this opens the staging view, at the first change.
             _ => self.focus_panel(Panel::Main, window, cx),
         }
     }
 
     pub fn back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.current_view();
-        if self.filters.remove(&view).is_some() {
+        if view == View::Staging && self.staging.anchor.take().is_some() {
+            cx.notify();
+        } else if self.filters.remove(&view).is_some() {
             self.after_change(cx);
         } else if self.focused == Panel::Main {
             self.focus_panel(self.last_side, window, cx);
@@ -1235,6 +1584,10 @@ impl Workspace {
     }
 
     pub fn toggle_stage(&mut self, _: &ToggleStage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_view() == View::Staging {
+            let action = if self.staging.staged { PatchAction::Unstage } else { PatchAction::Stage };
+            return self.apply_selection(action, window, cx);
+        }
         let Some(file) = self.selected_file(cx) else { return };
         let unborn = self.head_is_unborn(cx);
         self.op("Staging", window, cx, move |git, loc| async move {
@@ -1292,6 +1645,20 @@ impl Workspace {
     }
 
     pub fn discard(&mut self, _: &Discard, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_view() == View::Staging {
+            // lazygit: `d` on staged changes unstages them; on unstaged ones it discards.
+            if self.staging.staged {
+                return self.apply_selection(PatchAction::Unstage, window, cx);
+            }
+            // Built now, so a reload while the popup is open can't change what goes.
+            let Some(built) = self.build_selection(PatchAction::Discard, window, cx) else { return };
+            let what = if self.staging.hunk && self.staging.anchor.is_none() { "hunk" } else { "lines" };
+            let path = self.staging.path.clone().unwrap_or_default();
+            let message = format!("Discard the selected {what} in {path}? This can't be undone.");
+            return self.confirm("Discard changes", message, window, cx, move |this, window, cx| {
+                this.apply_built(built, PatchAction::Discard, window, cx)
+            });
+        }
         let Some(file) = self.selected_file(cx) else { return };
         let Some(root) = self.selected_root(cx) else { return };
         let what = if file.kind == FileKind::Untracked { "Delete untracked file" } else { "Discard all changes to" };
@@ -1584,6 +1951,30 @@ fn scroll_to_edge(handle: &UniformListScrollHandle, bottom: bool) {
     base.set_offset(point(base.offset().x, y));
 }
 
+/// Scrolls a list as little as possible to show `rows` (their top, if they don't all
+/// fit), going by its last layout.
+fn reveal(handle: &UniformListScrollHandle, rows: Range<usize>) {
+    let mut state = handle.0.borrow_mut();
+    let height = state.base_handle.bounds().size.height;
+    if height <= px(0.) {
+        drop(state);
+        return handle.scroll_to_item(rows.start, ScrollStrategy::Nearest);
+    }
+    state.deferred_scroll_to_item = None;
+    let base = &state.base_handle;
+    let offset = base.offset();
+    let top = -offset.y;
+    let (start, end) = (LINE_HEIGHT * rows.start as f32, LINE_HEIGHT * rows.end as f32);
+    let top = if start < top {
+        start
+    } else if end > top + height {
+        if end - height < start { end - height } else { start }
+    } else {
+        return;
+    };
+    base.set_offset(point(offset.x, (-top).clamp(-base.max_offset().y, px(0.))));
+}
+
 /// Rows that fit in a list's viewport, as of its last layout.
 fn visible_rows(handle: &UniformListScrollHandle) -> isize {
     let height = handle.0.borrow().base_handle.bounds().size.height;
@@ -1611,14 +2002,23 @@ async fn load_main(git: Git, location: RepoLocation, key: MainKey, file: Option<
             let Some(file) = file else {
                 return text(Ok(String::new()), TextKind::Plain);
             };
+            // The file list may be a moment behind (e.g. just after staging a line).
+            let file = match detail::file_status(&git, &location, &file).await {
+                Ok(Some(fresh)) => fresh,
+                Ok(None) => return text(Ok(String::new()), TextKind::Plain),
+                Err(_) => file,
+            };
+            if file.kind == FileKind::Unmerged {
+                // A combined diff: nothing in it can be staged line by line.
+                let diff = detail::file_diff(&git, &location, &file).await;
+                return text(diff.map(|d| String::from_utf8_lossy(&d.unstaged.unwrap_or_default()).into_owned()), TextKind::Diff);
+            }
             match detail::file_diff(&git, &location, &file).await {
-                Ok(FileDiff { unstaged: Some(u), staged: Some(s) }) => MainContent::Split {
-                    unstaged: Arc::new(detail::to_lines(&u)),
-                    staged: Arc::new(detail::to_lines(&s)),
+                Ok(FileDiff { unstaged: None, staged: None }) => text(Ok(String::new()), TextKind::Plain),
+                Ok(FileDiff { unstaged, staged }) => MainContent::File {
+                    unstaged: unstaged.as_deref().map(DiffHalf::new),
+                    staged: staged.as_deref().map(DiffHalf::new),
                 },
-                Ok(FileDiff { unstaged, staged }) => {
-                    text(Ok(unstaged.or(staged).unwrap_or_default()), TextKind::Diff)
-                }
                 Err(err) => text(Err(err), TextKind::Plain),
             }
         }

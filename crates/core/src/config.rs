@@ -21,6 +21,9 @@ pub struct Config {
     pub lazygit_command: Option<String>,
     /// Ask before `q` quits. It always asks while git is still running.
     pub confirm_quit: bool,
+    /// The staging view starts by selecting whole hunks rather than single lines, like
+    /// lazygit's `useHunkModeInStagingView`. `a` switches either way.
+    pub staging_hunk_mode: bool,
 }
 
 impl Default for Config {
@@ -33,6 +36,7 @@ impl Default for Config {
             poll_interval_secs: 60,
             lazygit_command: None,
             confirm_quit: true,
+            staging_hunk_mode: true,
         }
     }
 }
@@ -93,6 +97,8 @@ mod tests {
         assert_eq!(config.max_depth, 3);
         assert!(config.confirm_quit);
         assert!(!toml::from_str::<Config>("confirm_quit = false").unwrap().confirm_quit);
+        assert!(config.staging_hunk_mode);
+        assert!(!toml::from_str::<Config>("staging_hunk_mode = false").unwrap().staging_hunk_mode);
         assert!(toml::from_str::<Config>("typo = 1").is_err());
     }
 
