@@ -20,6 +20,12 @@ extra panel on the left listing the repos.
 Drag the gaps between panels to resize them: the three columns, the side panels below
 Status, and the main view against the command log.
 
+The layout survives restarts. Panel sizes, the window's size, position and display, the
+screen mode, whether the command log shows, the focused panel, each panel's tab, and each
+workdir's selected repo are saved on quit and every 30 s to
+`~/Library/Application Support/ubergit/state.json`. Delete the file to reset them. If the saved
+display is gone or the window would be off-screen, the window opens centred instead.
+
 ## Run
 
 ```sh
@@ -52,10 +58,23 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 |---|---|
 | Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `R` rescan · `@` toggle command log |
 | Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch all · `U` fast-forward repos that are behind · `o` open in lazygit |
-| Files | `space` stage/unstage · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
+| Files | `space` stage/unstage · `enter` stage lines · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
+| Staging (`enter` on a file) | `space` stage/unstage the selection · `d` discard it (in staged changes: unstage it) · `a` hunk or line selection · `v` range · `shift-↑`/`shift-↓` extend the range · `h`/`l` or `←`/`→` previous/next hunk · `tab` other half · `c` commit · `esc` back |
 | Branches | `space` checkout · `n` new · `d` delete · `f` fast-forward · `-` previous branch · `u` set upstream |
 | Remotes / Tags / Commits | `space` checkout · `n` new branch from it |
 | Stash | `space` apply · `g` pop · `d` drop · `r` rename · `n` new branch from stash |
+
+## Staging lines
+
+`enter` on a file opens lazygit's staging view in the main panel: unstaged changes above staged
+ones, with a cursor. Like lazygit 0.62, it starts by selecting hunks, the run of changed lines
+around the cursor. `a` switches to single lines, and `v` selects a range. `j`/`k` move to the next
+hunk or line. `space` stages the selection, or unstages it in the staged half, and `d` discards it
+after asking. Clicking a line puts the cursor there.
+
+Untracked, new, deleted and renamed files work too: staging part of a new file adds just those
+lines, and unstaging lines of a rename keeps the rename. Binary files, submodules and files with
+conflicts have no lines to pick; stage them whole from Files.
 
 ## Working across repos
 
@@ -88,6 +107,7 @@ fetch_interval_secs = 300
 poll_interval_secs = 60
 lazygit_command = "wezterm start --cwd {path} lazygit"   # default: new Terminal.app window
 confirm_quit = true           # q asks first; ⌘Q quits at once. Both ask while git is running
+staging_hunk_mode = true      # the staging view selects hunks first (false: lines); a switches
 ```
 
 ## Development
@@ -104,7 +124,8 @@ watcher. It has no UI dependency. `crates/app` holds the GPUI UI and depends on
 
 To check the UI without a person at the keyboard, build with `--features screenshot`. Then set
 `UBERGIT_SCRIPT`, e.g. `wait 2000; keys j 2; shot /tmp/a.png; type msg; key enter; quit`. It
-replays the keystrokes and saves offscreen PNGs of the real Metal-rendered frame.
+replays the keystrokes and saves offscreen PNGs of the real Metal-rendered frame. Scripted runs
+don't read or write `state.json` unless `UBERGIT_STATE` names a state file to use.
 
-Not in v1: staging individual lines or hunks, interactive rebase, cherry-pick, a
-merge-conflict UI, custom patches, a commit graph, and custom keybindings.
+Not in v1: interactive rebase, cherry-pick, a merge-conflict UI, custom patches, a commit
+graph, and custom keybindings.

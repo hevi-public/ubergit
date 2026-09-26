@@ -7,6 +7,7 @@ pub mod gh;
 pub mod git;
 pub mod model;
 pub mod ops;
+pub mod patch;
 mod process;
 pub mod summary;
 pub mod watch;

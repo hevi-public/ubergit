@@ -133,11 +133,24 @@ pub async fn load(
 
 const DIFF_FLAGS: &[&str] = &["--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"];
 
-/// Unstaged and staged diffs for one file, as lazygit shows them side by side.
+/// Unstaged and staged diffs for one file, as lazygit shows them side by side. They're
+/// the raw bytes, without textconv, so lines can be staged from them ([`crate::patch`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileDiff {
-    pub unstaged: Option<String>,
-    pub staged: Option<String>,
+    pub unstaged: Option<Vec<u8>>,
+    pub staged: Option<Vec<u8>>,
+}
+
+/// `file` as git sees it now, or `None` once it has no changes. The file list's copy can
+/// be a moment old (e.g. just after staging part of it).
+pub async fn file_status(git: &Git, repo: &RepoLocation, file: &FileEntry) -> anyhow::Result<Option<FileEntry>> {
+    let mut args: Vec<String> = ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--"]
+        .map(String::from)
+        .into();
+    args.push(file.path.clone());
+    args.extend(file.orig_path.clone());
+    let out = git.read(&repo.root, args).await?;
+    Ok(parse::status_v2(&out.stdout).files.into_iter().find(|f| f.path == file.path))
 }
 
 pub async fn file_diff(git: &Git, repo: &RepoLocation, file: &FileEntry) -> anyhow::Result<FileDiff> {
@@ -146,20 +159,20 @@ pub async fn file_diff(git: &Git, repo: &RepoLocation, file: &FileEntry) -> anyh
     paths.extend(file.orig_path.clone());
 
     if file.kind == FileKind::Untracked {
-        let mut args: Vec<String> = vec!["diff".into(), "--no-index".into()];
+        let mut args: Vec<String> = vec!["diff".into(), "--no-index".into(), "--no-textconv".into()];
         args.extend(DIFF_FLAGS.iter().map(|s| s.to_string()));
         args.extend(["--".into(), "/dev/null".into(), file.path.clone()]);
         let out = git
             .run(GitCommand::new(cwd, CmdKind::Read, args).ok_codes([1]))
             .await?;
         return Ok(FileDiff {
-            unstaged: Some(out.stdout_str()),
+            unstaged: Some(out.stdout),
             staged: None,
         });
     }
 
     let diff = |cached: bool| {
-        let mut args: Vec<String> = vec!["diff".into()];
+        let mut args: Vec<String> = vec!["diff".into(), "--no-textconv".into()];
         args.extend(DIFF_FLAGS.iter().map(|s| s.to_string()));
         if cached {
             args.push("--cached".into());
@@ -167,7 +180,7 @@ pub async fn file_diff(git: &Git, repo: &RepoLocation, file: &FileEntry) -> anyh
         }
         args.push("--".into());
         args.extend(paths.iter().cloned());
-        async move { git.read(cwd, args).await.map(|o| o.stdout_str()) }
+        async move { git.read(cwd, args).await.map(|o| o.stdout) }
     };
     let (unstaged, staged) = join(
         async {
