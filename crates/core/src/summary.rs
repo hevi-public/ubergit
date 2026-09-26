@@ -40,7 +40,8 @@ pub async fn summarize(git: &Git, repo: &RepoLocation) -> anyhow::Result<RepoSum
     };
 
     let remotes = list_remotes(git, &repo.root).await?;
-    let default_branch = default_branch(git, &repo.root, &remotes, status.upstream.as_deref()).await?;
+    let (default_branch, upstream_oid) =
+        default_branch_and_upstream(git, &repo.root, &remotes, status.upstream.as_deref()).await?;
     let head = status.head();
 
     let base = match (&default_branch, &head) {
@@ -59,7 +60,9 @@ pub async fn summarize(git: &Git, repo: &RepoLocation) -> anyhow::Result<RepoSum
     };
 
     Ok(RepoSummary {
+        head_oid: status.oid.clone(),
         upstream: status.upstream(),
+        upstream_oid,
         changes: status.change_counts(),
         stash_count: status.stash_count,
         head,
@@ -98,13 +101,15 @@ pub fn primary_remote<'a>(remotes: &'a [String], upstream: Option<&str>) -> Opti
 }
 
 /// Resolves the default branch: `<remote>/HEAD`, else `<remote>/main`, else
-/// `<remote>/master`; with no remote, local `main` then `master`.
-pub async fn default_branch(
+/// `<remote>/master`; with no remote, local `main` then `master`. Also reads the commit
+/// of `upstream` (status's short name for it) in the same `for-each-ref`, as this runs on
+/// every refresh of every repo.
+pub async fn default_branch_and_upstream(
     git: &Git,
     cwd: &Path,
     remotes: &[String],
     upstream: Option<&str>,
-) -> anyhow::Result<Option<DefaultBranch>> {
+) -> anyhow::Result<(Option<DefaultBranch>, Option<String>)> {
     let patterns: Vec<String> = match primary_remote(remotes, upstream) {
         Some(remote) => ["HEAD", "main", "master"]
             .iter()
@@ -112,35 +117,58 @@ pub async fn default_branch(
             .collect(),
         None => vec!["refs/heads/main".into(), "refs/heads/master".into()],
     };
+    let candidates = upstream.map(upstream_candidates).unwrap_or_default();
     let mut args = vec![
         "for-each-ref".to_string(),
-        "--format=%(refname)%1f%(symref)%1e".to_string(),
+        "--format=%(refname)%1f%(symref)%1f%(objectname)%1e".to_string(),
     ];
-    args.extend(patterns.iter().cloned());
+    args.extend(patterns.iter().chain(&candidates).cloned());
     let out = git.read(cwd, args).await?;
     let text = out.stdout_str();
-    let refs: Vec<(String, String)> = parse::records(&text)
+    let refs: Vec<(String, String, String)> = parse::records(&text)
         .filter_map(|f| match f[..] {
-            [name, symref] => Some((name.to_string(), symref.to_string())),
+            [name, symref, oid] => Some((name.to_string(), symref.to_string(), oid.to_string())),
             _ => None,
         })
         .collect();
-    Ok(pick_default_branch(&patterns, &refs))
+    Ok((pick_default_branch(&patterns, &refs), pick_upstream_oid(&candidates, &refs)))
 }
 
-/// `refs` are `(refname, symref-target)` pairs that exist, `patterns` in priority order.
-pub fn pick_default_branch(patterns: &[String], refs: &[(String, String)]) -> Option<DefaultBranch> {
-    for pattern in patterns {
-        let Some((name, symref)) = refs.iter().find(|(name, _)| name == pattern) else {
-            continue;
-        };
-        let full_ref = if symref.is_empty() { name } else { symref };
-        return Some(DefaultBranch {
-            short: short_ref(full_ref),
-            full_ref: full_ref.clone(),
-        });
-    }
-    None
+/// `refs` are `(refname, symref-target, oid)` triples that exist, `patterns` in priority order.
+pub fn pick_default_branch(patterns: &[String], refs: &[(String, String, String)]) -> Option<DefaultBranch> {
+    let (name, symref, _) = first_ref(patterns, refs)?;
+    let full_ref = if symref.is_empty() { name } else { symref };
+    Some(DefaultBranch {
+        short: short_ref(full_ref),
+        full_ref: full_ref.clone(),
+    })
+}
+
+/// The refs status's short name for an upstream may stand for, in the order git tries
+/// them (tags left out: an upstream is a branch). Status shortens a name only as far as it
+/// still resolves to the same ref, so the first of these that exists is the upstream:
+/// `origin/feat` is normally `refs/remotes/origin/feat`, a local upstream `main` is
+/// `refs/heads/main`, and beside a local branch named `origin/feat` the remote one is
+/// called `remotes/origin/feat`.
+pub fn upstream_candidates(short: &str) -> Vec<String> {
+    ["refs/", "refs/heads/", "refs/remotes/"]
+        .iter()
+        .map(|prefix| format!("{prefix}{short}"))
+        .collect()
+}
+
+/// The commit of the first of [`upstream_candidates`] in `refs`, as in [`pick_default_branch`].
+pub fn pick_upstream_oid(candidates: &[String], refs: &[(String, String, String)]) -> Option<String> {
+    first_ref(candidates, refs).map(|(_, _, oid)| oid.clone())
+}
+
+/// The first of `names` in `refs`, by exact name: `refs` holds what every pattern listed,
+/// and `for-each-ref` also lists the refs under a pattern, e.g. `refs/heads/origin/feat/x`
+/// for `refs/heads/origin/feat`.
+fn first_ref<'a>(names: &[String], refs: &'a [(String, String, String)]) -> Option<&'a (String, String, String)> {
+    names
+        .iter()
+        .find_map(|wanted| refs.iter().find(|(name, ..)| name == wanted))
 }
 
 pub fn short_ref(full_ref: &str) -> String {
@@ -224,13 +252,48 @@ mod tests {
             .map(|b| format!("refs/remotes/origin/{b}"))
             .collect();
         let refs = vec![
-            ("refs/remotes/origin/HEAD".into(), "refs/remotes/origin/develop".into()),
-            ("refs/remotes/origin/main".into(), String::new()),
+            ("refs/remotes/origin/HEAD".into(), "refs/remotes/origin/develop".into(), "d1".into()),
+            ("refs/remotes/origin/main".into(), String::new(), "m1".into()),
         ];
         let picked = pick_default_branch(&patterns, &refs).unwrap();
         assert_eq!(picked.short, "origin/develop");
         let picked = pick_default_branch(&patterns, &refs[1..]).unwrap();
         assert_eq!(picked.full_ref, "refs/remotes/origin/main");
         assert_eq!(pick_default_branch(&patterns, &[]), None);
+    }
+
+    #[test]
+    fn upstream_oid_is_picked_by_exact_name() {
+        let refs: Vec<(String, String, String)> = [
+            ("refs/heads/main", "", "local-main"),
+            ("refs/heads/origin/feat/x", "", "local-feat-x"),
+            ("refs/heads/origin/fix", "", "local-fix"),
+            ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", "main"),
+            ("refs/remotes/origin/feat", "", "feat"),
+            ("refs/remotes/origin/fix", "", "fix"),
+            ("refs/remotes/origin/main", "", "main"),
+            ("refs/remotes/origin/old/x", "", "old-x"),
+        ]
+        .iter()
+        .map(|(name, symref, oid)| (name.to_string(), symref.to_string(), oid.to_string()))
+        .collect();
+        let oid = |short: &str| pick_upstream_oid(&upstream_candidates(short), &refs);
+
+        // On main tracking origin/main, one ref serves both lookups.
+        assert_eq!(oid("origin/main").as_deref(), Some("main"));
+        let patterns: Vec<String> = ["HEAD", "main", "master"]
+            .iter()
+            .map(|b| format!("refs/remotes/origin/{b}"))
+            .collect();
+        assert_eq!(pick_default_branch(&patterns, &refs).unwrap().short, "origin/main");
+        // `refs/heads/origin/feat` is tried first and lists `refs/heads/origin/feat/x`.
+        assert_eq!(oid("origin/feat").as_deref(), Some("feat"));
+        // A gone upstream: only a branch under its name is left.
+        assert_eq!(oid("origin/old"), None);
+        // Beside a local `origin/fix`, status calls the remote one `remotes/origin/fix`,
+        // and `origin/fix` is a local upstream.
+        assert_eq!(oid("remotes/origin/fix").as_deref(), Some("fix"));
+        assert_eq!(oid("origin/fix").as_deref(), Some("local-fix"));
+        assert_eq!(oid("main").as_deref(), Some("local-main"));
     }
 }

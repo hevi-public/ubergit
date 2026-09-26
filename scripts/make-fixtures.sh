@@ -87,6 +87,15 @@ g -C "$DIR/gone" push -q -u origin old-feature 2>/dev/null
 g -C "$DIR/.helpers/gone" push -q origin --delete old-feature 2>/dev/null
 g -C "$DIR/gone" fetch -q --prune
 
+# --- feature branch tracking local main (branch.feature.remote = .)
+g init -q "$DIR/local-upstream"; commit "$DIR/local-upstream" a.txt "one"
+g -C "$DIR/local-upstream" checkout -q -b feature; commit "$DIR/local-upstream" a.txt "two"
+g -C "$DIR/local-upstream" branch -q --set-upstream-to=main
+
+# --- a local branch named origin/main, so status calls the upstream remotes/origin/main
+origin ambiguous-upstream; clone ambiguous-upstream
+g -C "$DIR/ambiguous-upstream" branch -q origin/main HEAD~1
+
 # --- no remote at all
 g init -q "$DIR/no-remote"; commit "$DIR/no-remote" a.txt "one"; commit "$DIR/no-remote" a.txt "two"
 
@@ -131,8 +140,9 @@ g -C "$DIR/with-submodule" commit -qm "add submodule"
 origin shallow; upstream_work shallow 3
 g clone -q --depth 1 "file://$DIR/.origins/shallow.git" "$DIR/shallow" 2>/dev/null
 
-# --- bare repo inside the workdir
+# --- bare repos inside the workdir: empty, and a clone with commits
 g init -q --bare "$DIR/bare-repo.git"
+g clone -q --bare "$DIR/.origins/synced.git" "$DIR/bare-clone.git"
 
 # --- nested one level down, and one hidden inside node_modules (must be skipped)
 origin nested; clone nested group/nested-svc
