@@ -482,7 +482,10 @@ fn encode_path(text: &str) -> String {
 }
 
 /// `gh auth status --json hosts`: the hosts whose login works. gh uses a host's active
-/// account, so that one decides when it's marked.
+/// account, so that one decides when it's marked. gh checks each login against the API,
+/// so offline every host is in `error` (or `timeout`): only a rejected token (HTTP 401)
+/// counts as logged out. Otherwise the host stays, and its lookups fail as unreachable,
+/// keeping the last answers, rather than the app claiming the user is logged out.
 fn parse_auth_hosts(stdout: &[u8]) -> Option<Vec<String>> {
     #[derive(Deserialize)]
     struct Status {
@@ -493,10 +496,19 @@ fn parse_auth_hosts(stdout: &[u8]) -> Option<Vec<String>> {
         #[serde(default)]
         active: bool,
         state: String,
+        #[serde(default)]
+        error: String,
     }
 
     let status: Status = serde_json::from_slice(stdout).ok()?;
-    let works = |account: &Account| account.state == "success";
+    // gh's words for it, e.g. `non-200 OK status code: 401 Unauthorized body: ...`. A bare
+    // `401` could be part of a port or an address in a network error.
+    let rejected = |error: &str| error.contains("status code: 401") || error.contains("HTTP 401");
+    let works = |account: &Account| match account.state.as_str() {
+        "success" | "timeout" => true,
+        "error" => !rejected(&account.error),
+        _ => false,
+    };
     Some(
         status
             .hosts
@@ -1148,18 +1160,38 @@ mod tests {
     fn reads_the_hosts_with_a_working_login() {
         let status = br#"{"hosts":{
             "github.com":[{"active":true,"gitProtocol":"https","host":"github.com","login":"me","scopes":"repo","state":"success","tokenSource":"keyring"}],
-            "ghe.broken.example":[{"active":true,"host":"ghe.broken.example","login":"me","state":"error","tokenSource":"keyring"}],
+            "ghe.revoked.example":[{"active":true,"host":"ghe.revoked.example","login":"me","state":"error","tokenSource":"keyring",
+                "error":"non-200 OK status code: 401 Unauthorized body: \"{\\\"message\\\": \\\"Bad credentials\\\"}\""}],
             "ghe.switched.example":[
-                {"active":false,"host":"ghe.switched.example","login":"old","state":"error"},
+                {"active":false,"host":"ghe.switched.example","login":"old","state":"error","error":"non-200 OK status code: 401 Unauthorized"},
                 {"active":true,"host":"ghe.switched.example","login":"me","state":"success"}],
             "ghe.inactive.example":[
-                {"active":true,"host":"ghe.inactive.example","login":"a","state":"timeout"},
+                {"active":true,"host":"ghe.inactive.example","login":"a","state":"error","error":"non-200 OK status code: 401 Unauthorized"},
                 {"active":false,"host":"ghe.inactive.example","login":"b","state":"success"}]
         }}"#;
         assert_eq!(
             parse_auth_hosts(status),
             Some(vec!["ghe.switched.example".to_string(), "github.com".to_string()])
         );
+        // Offline: what gh 2.98 reports when it can't reach the API. The login may be fine,
+        // even with a 401 in the port or the address.
+        let offline = br#"{"hosts":{
+            "github.com":[{"active":true,"gitProtocol":"https","host":"github.com","state":"error","tokenSource":"keyring",
+                "error":"Get \"https://api.github.com/\": dial tcp: lookup api.github.com: no such host"}],
+            "ghe.slow.example":[{"active":true,"host":"ghe.slow.example","login":"me","state":"timeout"}],
+            "ghe.port.example":[{"active":true,"host":"ghe.port.example","login":"me","state":"error",
+                "error":"Get \"https://ghe.port.example:8401/api/v3/\": dial tcp 10.0.0.1:8401: connect: connection refused"}],
+            "ghe.v6.example":[{"active":true,"host":"ghe.v6.example","login":"me","state":"error",
+                "error":"Get \"https://ghe.v6.example/api/v3/\": dial tcp [2001:db8::401]:443: i/o timeout"}]
+        }}"#;
+        assert_eq!(
+            parse_auth_hosts(offline),
+            Some(["ghe.port.example", "ghe.slow.example", "ghe.v6.example", "github.com"].map(String::from).to_vec())
+        );
+        // What gh says for a rejected token besides the status code.
+        let revoked = br#"{"hosts":{"github.com":[{"active":true,"host":"github.com","state":"error",
+            "error":"HTTP 401: Bad credentials (https://api.github.com/graphql)"}]}}"#;
+        assert_eq!(parse_auth_hosts(revoked), Some(vec![]));
         assert_eq!(parse_auth_hosts(br#"{"hosts":{}}"#), Some(vec![]));
         assert_eq!(parse_auth_hosts(b"not json"), None);
     }

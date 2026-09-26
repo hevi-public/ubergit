@@ -1115,7 +1115,7 @@ esac
         // A URL that names no GitHub repo says so whatever gh's state.
         let gitlab = repo_with_origin(dir.path(), "gitlab", "https://gitlab.com/group/sub/r.git");
         let requests = || vec![request(&github, "feat"), request(&gitlab, "feat")];
-        let not_logged_in = r#"{"github.com":[{"active":true,"host":"github.com","login":"me","state":"error"}]}"#;
+        let not_logged_in = r#"{"github.com":[{"active":true,"host":"github.com","login":"me","state":"error","error":"non-200 OK status code: 401 Unauthorized"}]}"#;
         let gh = fake_gh(dir.path(), not_logged_in);
         let found = block_on(look_up(&git(), &gh, dir.path(), true, None, requests()));
         assert_eq!(found.gh, Some(GhStatus::NotLoggedIn));
