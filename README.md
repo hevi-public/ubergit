@@ -45,7 +45,8 @@ Everything goes through the `git` CLI, so your hooks, signing, credential helper
 ## Keys
 
 lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0` jumps to the main view,
-`j`/`k` move, `[`/`]` switch tabs, `/` filters, `?` lists all keys, `+`/`_` change the screen mode, `q` quits.
+`j`/`k` move, `[`/`]` switch tabs, `/` filters, `?` lists all keys, `+`/`_` change the screen mode, `q` quits
+(press `q` again, or `enter`, to confirm; `⌘Q` quits at once unless git is still running).
 
 | Where | Keys |
 |---|---|
@@ -86,6 +87,7 @@ auto_fetch = true
 fetch_interval_secs = 300
 poll_interval_secs = 60
 lazygit_command = "wezterm start --cwd {path} lazygit"   # default: new Terminal.app window
+confirm_quit = true           # q asks first; ⌘Q quits at once. Both ask while git is running
 ```
 
 ## Development

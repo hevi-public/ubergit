@@ -767,6 +767,22 @@ impl Workspace {
                     .into_any_element();
                 (title.to_string(), body, px(620.))
             }
+            Dialog::Quit { message } => {
+                // The question, then (in yellow) any repos git is still running in.
+                let body = div()
+                    .flex()
+                    .flex_col()
+                    .children(message.lines().enumerate().map(|(ix, l)| {
+                        div()
+                            .h(LINE_HEIGHT)
+                            .whitespace_nowrap()
+                            .when(ix > 0, |d| d.text_color(Palette::yellow()))
+                            .child(l.to_string())
+                    }))
+                    .child(div().mt(px(8.)).text_color(Palette::blue()).child("q/<enter>: quit · <esc>: cancel"))
+                    .into_any_element();
+                ("Quit".to_string(), body, px(680.))
+            }
             Dialog::Prompt { title, input, .. } => {
                 let body = div()
                     .flex()
@@ -819,7 +835,11 @@ impl Workspace {
         if inputs {
             bordered = bordered.child(body);
         } else {
-            let context = if matches!(dialog, Dialog::Help { .. }) { "Help" } else { "Popup" };
+            let context = match dialog {
+                Dialog::Help { .. } => "Help",
+                Dialog::Quit { .. } => "QuitPopup",
+                _ => "Popup",
+            };
             bordered = bordered.child(
                 div()
                     .key_context(context)
@@ -1092,6 +1112,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_command_log))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::quit_app))
             .on_action(cx.listener(Self::fetch))
             .on_action(cx.listener(Self::fetch_all))
             .on_action(cx.listener(Self::pull))
