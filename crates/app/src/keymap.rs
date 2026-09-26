@@ -45,6 +45,7 @@ actions!(
         ToggleCommandLog,
         Refresh,
         Quit,
+        QuitApp,
         // remote
         Fetch,
         FetchAll,
@@ -146,9 +147,10 @@ keymap! {
     "_", "Panels" => PrevScreenMode, "Previous screen mode";
     "@", "Panels" => ToggleCommandLog, "Toggle command log";
     "shift-r", "Panels" => Refresh, "Refresh (no fetch)";
-    "q", "Panels" => Quit, "Quit";
+    "q", "Panels" => Quit, "Quit (asks first)";
     "ctrl-c", "Panels" => Quit, "";
-    "cmd-q", "Panels" => Quit, "";
+    // Everywhere, popups included: quits at once unless git is still running.
+    "cmd-q", "Workspace" => QuitApp, "";
     "f", "Panels" => Fetch, "Fetch";
     "p", "Panels" => Pull, "Pull";
     "shift-p", "Panels" => Push, "Push";
@@ -197,6 +199,9 @@ keymap! {
 
     // Popups
     "escape", "Dialog" => CloseDialog, "Close";
+    // The quit popup: q (or ctrl-c) again quits.
+    "q", "QuitPopup" => ConfirmDialog, "";
+    "ctrl-c", "QuitPopup" => ConfirmDialog, "";
     "enter", "Dialog" => ConfirmDialog, "Confirm";
     "q", "Help" => CloseDialog, "";
     "?", "Help" => CloseDialog, "";

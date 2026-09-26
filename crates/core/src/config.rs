@@ -19,6 +19,8 @@ pub struct Config {
     /// Shell command run by `o` to open lazygit on the selected repo; `{path}` is
     /// replaced by the repo path. Defaults to a new Terminal.app window.
     pub lazygit_command: Option<String>,
+    /// Ask before `q` quits. It always asks while git is still running.
+    pub confirm_quit: bool,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             fetch_interval_secs: 300,
             poll_interval_secs: 60,
             lazygit_command: None,
+            confirm_quit: true,
         }
     }
 }
@@ -88,6 +91,8 @@ mod tests {
         assert_eq!(config.workdir, Some(PathBuf::from("/x")));
         assert_eq!(config.fetch_interval_secs, 60);
         assert_eq!(config.max_depth, 3);
+        assert!(config.confirm_quit);
+        assert!(!toml::from_str::<Config>("confirm_quit = false").unwrap().confirm_quit);
         assert!(toml::from_str::<Config>("typo = 1").is_err());
     }
 

@@ -223,6 +223,10 @@ pub enum Dialog {
     Help {
         scroll: UniformListScrollHandle,
     },
+    /// "Quit ubergit?", and which repos git is still busy in.
+    Quit {
+        message: SharedString,
+    },
     /// Per-repo outcomes of a multi-repo action, filled in as each repo finishes.
     Results {
         id: u64,
@@ -867,8 +871,40 @@ impl Workspace {
         });
     }
 
-    pub fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
+    /// `q`: asks first (unless `confirm_quit = false` and nothing is running).
+    pub fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        let confirm = self.store.read(cx).config.confirm_quit;
+        self.request_quit(confirm, window, cx);
+    }
+
+    /// `cmd-q`: quits at once unless git is still running, like other macOS apps.
+    pub fn quit_app(&mut self, _: &QuitApp, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.dialog, Some(Dialog::Quit { .. })) {
+            return cx.quit();
+        }
+        self.request_quit(false, window, cx);
+    }
+
+    fn request_quit(&mut self, confirm: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let busy: Vec<String> = store
+            .repos
+            .iter()
+            .filter_map(|r| r.busy.as_ref().map(|label| format!("  {}  ({label})", r.name())))
+            .collect();
+        if busy.is_empty() && !confirm {
+            return cx.quit();
+        }
+        let mut message = "Quit ubergit?".to_string();
+        if !busy.is_empty() {
+            let repos = if busy.len() == 1 { "1 repo" } else { &format!("{} repos", busy.len()) };
+            message.push_str(&format!("\n\nGit is still running in {repos}; quitting now may interrupt it:\n"));
+            message.push_str(&busy.iter().take(8).cloned().collect::<Vec<_>>().join("\n"));
+            if busy.len() > 8 {
+                message.push_str(&format!("\n  and {} more", busy.len() - 8));
+            }
+        }
+        self.open_dialog(Dialog::Quit { message: message.into() }, window, cx);
     }
 
     // ---- dialogs --------------------------------------------------------------------------
@@ -935,6 +971,7 @@ impl Workspace {
                     ops::commit(&git, &loc, &message, amend).await
                 });
             }
+            Dialog::Quit { .. } => cx.quit(),
             Dialog::Error { .. } | Dialog::Help { .. } | Dialog::Results { .. } => {}
         }
         cx.notify();
