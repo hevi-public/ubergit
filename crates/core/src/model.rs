@@ -326,6 +326,8 @@ pub struct Worktree {
     pub head: Option<String>,
     pub branch: Option<String>,
     pub bare: bool,
+    /// Its directory or its git dir is gone: `git worktree prune` would drop it.
+    pub prunable: bool,
     pub is_current: bool,
 }
 

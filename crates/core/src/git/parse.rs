@@ -328,6 +328,7 @@ pub fn worktrees(out: &[u8], current: &std::path::Path) -> Vec<Worktree> {
                     head: None,
                     branch: None,
                     bare: false,
+                    prunable: false,
                 });
             }
             "HEAD" => {
@@ -343,6 +344,11 @@ pub fn worktrees(out: &[u8], current: &std::path::Path) -> Vec<Worktree> {
             "bare" => {
                 if let Some(wt) = current_wt.as_mut() {
                     wt.bare = true;
+                }
+            }
+            "prunable" => {
+                if let Some(wt) = current_wt.as_mut() {
+                    wt.prunable = true;
                 }
             }
             _ => {}
@@ -458,10 +464,12 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
 
     #[test]
     fn worktree_list() {
-        let out = b"worktree /a\0HEAD abc\0branch refs/heads/main\0\0worktree /b\0HEAD def\0detached\0\0";
+        let out = b"worktree /a\0HEAD abc\0branch refs/heads/main\0\0worktree /b\0HEAD def\0detached\0\0\
+            worktree /c\0HEAD 123\0branch refs/heads/c\0prunable gitdir file points to non-existent location\0\0";
         let wts = worktrees(out, std::path::Path::new("/b"));
-        assert_eq!(wts.len(), 2);
+        assert_eq!(wts.len(), 3);
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
         assert!(wts[1].is_current && wts[1].branch.is_none());
+        assert!(!wts[1].prunable && wts[2].prunable);
     }
 }
