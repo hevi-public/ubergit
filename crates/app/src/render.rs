@@ -7,10 +7,12 @@ use std::sync::Arc;
 use gpui_kit::base::{ResizeHandleContext, ResizeHandleRenderer, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::{prelude::*, *};
+use ubergit_core::pr_status::PrView;
 use ubergit_core::{CmdKind, FileKind, Head, RepoSummary, Upstream};
 
 use crate::batch::{BatchRow, Outcome, headline};
 use crate::keymap::{self, *};
+use crate::pr;
 use crate::store::{RepoEntry, RepoStore};
 use crate::text::{Line, age, truncate};
 use crate::theme::{FONT, FONT_SIZE, LINE_HEIGHT, Palette};
@@ -25,6 +27,17 @@ const COLUMN_GAP: Pixels = px(4.);
 const MIN_PANEL: Pixels = px(40.);
 /// Advance of one Menlo glyph at 13px.
 const CHAR_WIDTH: Pixels = px(7.83);
+/// The Repos panel's branch column, at most and at least: a narrow panel cuts the branch
+/// down to the smaller before it cuts the names.
+const MAX_BRANCH: usize = 22;
+const MIN_BRANCH: usize = 10;
+
+/// Widths of the Repos panel's name and branch, in characters.
+#[derive(Clone, Copy, Default)]
+struct RepoColumns {
+    name: usize,
+    branch: usize,
+}
 
 /// Resize handles are invisible until hovered or dragged, then show as a thin line in
 /// the active border colour, so the gaps between frames look like lazygit's.
@@ -184,24 +197,28 @@ impl Workspace {
                 let visible = this.visible(view, store);
                 let cursor = this.cursor(view, visible.len());
                 let active = this.is_active(panel) || (this.focused == Panel::Main && this.last_side == panel);
-                // Leave room for branch + status after the name in the Repos column.
-                let repos_width = this
-                    .layout
-                    .columns
-                    .read(cx)
-                    .sizes()
-                    .first()
-                    .copied()
-                    .filter(|w| *w > px(0.))
-                    .unwrap_or(this.layout.repos_width);
-                let panel_chars = (repos_width / CHAR_WIDTH) as usize;
-                let reserved = if this.marked.is_empty() { 20 } else { 22 };
-                let longest = store.repos.iter().map(|r| r.name().chars().count()).max().unwrap_or(0);
-                let name_width = longest.min(panel_chars.saturating_sub(reserved).max(10));
+                let columns = match view {
+                    View::Repos => {
+                        let repos_width = this
+                            .layout
+                            .columns
+                            .read(cx)
+                            .sizes()
+                            .first()
+                            .copied()
+                            .filter(|w| *w > px(0.))
+                            .unwrap_or(this.layout.repos_width);
+                        // Less the gap to the next column, the frame's border and padding, and
+                        // the row's padding.
+                        let text_width = repos_width - COLUMN_GAP - px(2. + 6. + 8.);
+                        this.repo_columns(&visible, store, (text_width / CHAR_WIDTH) as usize)
+                    }
+                    _ => RepoColumns::default(),
+                };
                 range
                     .filter_map(|pos| {
                         let ix = *visible.get(pos)?;
-                        let line = this.row(view, ix, store, name_width);
+                        let line = this.row(view, ix, store, columns);
                         let selected = pos == cursor;
                         Some(
                             div()
@@ -233,9 +250,47 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn row(&self, view: View, ix: usize, store: &RepoStore, name_width: usize) -> Line {
+    /// The Repos panel's name and branch widths for `rows`, the repos listed, in `width`
+    /// characters. The upstream marker and the PR badge after the branch always fit: the
+    /// branch gives way first, down to [`MIN_BRANCH`], then the names, down to 10.
+    fn repo_columns(&self, rows: &[usize], store: &RepoStore, width: usize) -> RepoColumns {
+        // The mark column, the glyph and a space before the name, and a space after it.
+        let around_name = if self.marked.is_empty() { 3 } else { 5 };
+        let room = width.saturating_sub(around_name);
+        // Each row's branch, and what follows it up to the badge.
+        let tails: Vec<(usize, usize)> = rows
+            .iter()
+            .filter_map(|&ix| {
+                let entry = &store.repos[ix];
+                let s = entry.summary.as_ref()?;
+                let branch = match &s.head {
+                    Head::Branch(b) | Head::Unborn(b) => b.chars().count(),
+                    Head::Detached(_) => "@1234567".len(),
+                };
+                let mut after = Line::new();
+                upstream_spans(&mut after, &s.upstream);
+                if let Some(badge) = pr::badge(&store.pr_view(entry)) {
+                    after.append(badge);
+                }
+                Some((branch, after.width()))
+            })
+            .collect();
+        let widest = |branch_width: usize| tails.iter().map(|&(b, after)| b.min(branch_width) + after).max().unwrap_or(0);
+        let longest = rows.iter().map(|&ix| store.repos[ix].name().chars().count()).max().unwrap_or(0);
+        let branch = (MIN_BRANCH..=MAX_BRANCH)
+            .rev()
+            .find(|&w| longest + widest(w) <= room)
+            .unwrap_or(MIN_BRANCH);
+        RepoColumns {
+            name: longest.min(room.saturating_sub(widest(branch)).max(10)),
+            branch,
+        }
+    }
+
+    fn row(&self, view: View, ix: usize, store: &RepoStore, columns: RepoColumns) -> Line {
         if view == View::Repos {
-            return self.repo_row(&store.repos[ix], name_width);
+            let entry = &store.repos[ix];
+            return self.repo_row(entry, store.pr_view(entry), columns);
         }
         let Some(d) = store.selected_detail() else { return Line::new() };
         let mut line = Line::new();
@@ -334,7 +389,8 @@ impl Workspace {
         line
     }
 
-    fn repo_row(&self, entry: &RepoEntry, name_width: usize) -> Line {
+    fn repo_row(&self, entry: &RepoEntry, pr: PrView, columns: RepoColumns) -> Line {
+        let name_width = columns.name;
         let mut line = Line::new();
         let mut name_end = name_width + 3;
         if !self.marked.is_empty() {
@@ -361,10 +417,13 @@ impl Workspace {
             return line;
         };
         match &s.head {
-            Head::Branch(b) | Head::Unborn(b) => line.color(truncate(b, 22), Palette::blue()),
+            Head::Branch(b) | Head::Unborn(b) => line.color(truncate(b, columns.branch), Palette::blue()),
             Head::Detached(oid) => line.color(format!("@{}", oid.get(..7).unwrap_or(oid)), Palette::yellow()),
         };
         upstream_spans(&mut line, &s.upstream);
+        if let Some(badge) = pr::badge(&pr) {
+            line.append(badge);
+        }
         if let Some(base) = &s.base {
             let base_name = base.base.rsplit('/').next().unwrap_or(&base.base);
             let on_base = s.head.branch_name() == Some(base_name)
@@ -540,6 +599,7 @@ impl Workspace {
                 let visible = this.visible(View::Repos, store);
                 let cursor = this.cursor(View::Repos, visible.len());
                 let marks = !this.marked.is_empty();
+                let prs = pr::column_shown(&store.gh_status);
                 range
                     .map(|pos| {
                         let mut line = Line::new();
@@ -547,13 +607,13 @@ impl Workspace {
                             if marks {
                                 line.push("  ");
                             }
-                            line.append(overview_header(name_w));
+                            line.append(overview_header(name_w, prs));
                         } else if let Some(&ix) = visible.get(pos - 1) {
                             let entry = &store.repos[ix];
                             if marks {
                                 mark_column(&mut line, this.marked.contains(&entry.location.root));
                             }
-                            line.append(overview_row(entry, name_w));
+                            line.append(overview_row(entry, name_w, prs.then(|| store.pr_view(entry))));
                         }
                         div()
                             .id(pos)
@@ -577,10 +637,21 @@ impl Workspace {
         let Some(entry) = store.selected_entry() else {
             return div().into_any_element();
         };
+        // Characters a value has after its key: the main column's in the normal screen mode,
+        // which the other modes only make wider.
+        let value_width = self
+            .layout
+            .columns
+            .read(cx)
+            .sizes()
+            .get(2)
+            .filter(|w| **w > px(0.))
+            .map_or(90, |w| (*w / CHAR_WIDTH) as usize)
+            .saturating_sub(19);
         let mut lines: Vec<Line> = Vec::new();
         let mut kv = |key: &str, value: Line| {
             let mut line = Line::new();
-            line.color(format!("{key:<14}"), Palette::dim());
+            line.color(format!("{key:<16}"), Palette::dim());
             line.append(value);
             lines.push(line);
         };
@@ -640,6 +711,12 @@ impl Workspace {
                 }
             }
             kv("Default branch", base);
+            // A repo that can't be read says so above; its old branch's PR would mislead.
+            if entry.error.is_none() {
+                for (key, value) in pr::status_rows(&store.pr_view(entry), pr::remote_repo(entry), value_width) {
+                    kv(key, value);
+                }
+            }
             let c = s.changes;
             let mut changes = Line::new();
             if c.files == 0 {
@@ -703,12 +780,17 @@ impl Workspace {
             .rev()
             .map(|record| {
                 let mut line = Line::new();
-                let name = store
-                    .repos
-                    .iter()
-                    .find(|r| record.cwd.starts_with(&r.location.root))
-                    .map(|r| r.name().to_string())
-                    .unwrap_or_else(|| record.cwd.display().to_string());
+                // gh runs in the workdir for every repo at once, so its path would say nothing.
+                let name = if record.command.starts_with("gh ") {
+                    "gh".to_string()
+                } else {
+                    store
+                        .repos
+                        .iter()
+                        .find(|r| record.cwd.starts_with(&r.location.root))
+                        .map(|r| r.name().to_string())
+                        .unwrap_or_else(|| record.cwd.display().to_string())
+                };
                 line.color(format!("{name}: "), Palette::cyan());
                 let color = if record.kind == CmdKind::Network { Palette::blue() } else { Palette::fg() };
                 line.color(&record.command, color);
@@ -1296,17 +1378,23 @@ fn mark_column(line: &mut Line, marked: bool) {
     }
 }
 
-fn overview_header(name_w: usize) -> Line {
+/// The overview's column titles; `prs` adds the PR column.
+fn overview_header(name_w: usize, prs: bool) -> Line {
     let mut line = Line::new();
-    let header = format!(
-        "  {:<name_w$}  {:<22} {:<9} {:<16} {:<16} {:>5}  {:<7} {}",
-        "REPO", "BRANCH", "UPSTREAM", "VS DEFAULT", "CHANGES", "STASH", "FETCHED", "STATE"
-    );
+    let mut header = format!("  {:<name_w$}  {:<22} ", "REPO", "BRANCH");
+    if prs {
+        header.push_str(&format!("{:<18} ", "PR"));
+    }
+    header.push_str(&format!(
+        "{:<9} {:<16} {:<16} {:>5}  {:<7} {}",
+        "UPSTREAM", "VS DEFAULT", "CHANGES", "STASH", "FETCHED", "STATE"
+    ));
     line.bold(header, Palette::dim());
     line
 }
 
-fn overview_row(entry: &RepoEntry, name_w: usize) -> Line {
+/// One repo's overview line, with a PR cell when given what to show for its PR.
+fn overview_row(entry: &RepoEntry, name_w: usize, pr: Option<PrView>) -> Line {
     let mut line = Line::new();
     let (glyph, color) = match &entry.summary {
         _ if entry.error.is_some() => ("⚠", Palette::red()),
@@ -1327,6 +1415,14 @@ fn overview_row(entry: &RepoEntry, name_w: usize) -> Line {
         Head::Detached(oid) => format!("@{}", oid.get(..7).unwrap_or(oid)),
     };
     line.color(format!("{branch:<22} "), if matches!(s.head, Head::Detached(_)) { Palette::yellow() } else { Palette::blue() });
+    // Next to the branch it's for, and early enough that long repo names don't push it
+    // out of the window.
+    if let Some(pr) = pr {
+        // Blank for a repo that can't be read: its summary, and so its branch, may be old.
+        let mut cell = if entry.error.is_some() { Line::new() } else { pr::cell(&pr) };
+        cell.pad_to(18).push(" ");
+        line.append(cell);
+    }
     let (upstream, up_color) = match &s.upstream {
         Upstream::None => ("-".to_string(), Palette::dim()),
         Upstream::Gone { .. } => ("gone".to_string(), Palette::red()),

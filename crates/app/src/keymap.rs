@@ -154,7 +154,7 @@ keymap! {
     "+", "Panels" => NextScreenMode, "Next screen mode (normal/half/full)";
     "_", "Panels" => PrevScreenMode, "Previous screen mode";
     "@", "Panels" => ToggleCommandLog, "Toggle command log";
-    "shift-r", "Panels" => Refresh, "Refresh (no fetch)";
+    "shift-r", "Panels" => Refresh, "Rescan, re-check gh and refresh PR status (no fetch)";
     "q", "Panels" => Quit, "Quit (asks first)";
     "ctrl-c", "Panels" => Quit, "";
     // Everywhere, popups included: quits at once unless git is still running.

@@ -60,11 +60,35 @@ impl Line {
 
     /// Pads with spaces up to `width` characters.
     pub fn pad_to(&mut self, width: usize) -> &mut Self {
-        let len = self.text.chars().count();
+        let len = self.width();
         if len < width {
             self.text.extend(std::iter::repeat_n(' ', width - len));
         }
         self
+    }
+
+    /// Length in characters. Laying lines out by it takes each character as one column of
+    /// the monospace font, which a wide one, like CJK or most emoji, isn't.
+    pub fn width(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// The text in runs, each with its colour (`None` unstyled), for tests to check.
+    #[cfg(test)]
+    pub fn spans(&self) -> Vec<(&str, Option<Hsla>)> {
+        let mut spans = Vec::new();
+        let mut at = 0;
+        for (range, style) in &self.highlights {
+            if range.start > at {
+                spans.push((&self.text[at..range.start], None));
+            }
+            spans.push((&self.text[range.clone()], style.color));
+            at = range.end;
+        }
+        if at < self.text.len() {
+            spans.push((&self.text[at..], None));
+        }
+        spans
     }
 
     pub fn build(&self) -> StyledText {
