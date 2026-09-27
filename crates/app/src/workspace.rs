@@ -1821,6 +1821,9 @@ impl Workspace {
 
     pub fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Fetch", window, cx);
+            }
             return self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
         }
         let Some(root) = self.selected_root(cx) else { return };
@@ -1835,13 +1838,20 @@ impl Workspace {
 
     /// `F`: the marked repos, else every listed one. A collapsed worktree shares its main
     /// checkout's git dir, so fetching that fetches for it too.
-    pub fn fetch_all(&mut self, _: &FetchAll, _: &mut Window, cx: &mut Context<Self>) {
-        let roots = self.marked_targets(cx).unwrap_or_else(|| self.listed_roots(cx));
+    pub fn fetch_all(&mut self, _: &FetchAll, window: &mut Window, cx: &mut Context<Self>) {
+        let marked = self.marked_targets(cx);
+        if marked.as_ref().is_some_and(|roots| roots.is_empty()) {
+            return self.no_listed_marks("Fetch all", window, cx);
+        }
+        let roots = marked.unwrap_or_else(|| self.listed_roots(cx));
         self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
     }
 
     pub fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Pull", window, cx);
+            }
             return self.pull_repos(roots, window, cx);
         }
         self.op("Pulling", window, cx, |git, loc| async move { ops::pull(&git, &loc).await });
@@ -1849,6 +1859,9 @@ impl Workspace {
 
     pub fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Push", window, cx);
+            }
             return self.push_repos(roots, window, cx);
         }
         let Some(root) = self.selected_root(cx) else { return };

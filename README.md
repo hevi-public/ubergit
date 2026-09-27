@@ -114,7 +114,8 @@ Status, PR lookups and auto-fetch keep covering hidden worktrees; only actions s
 Mark repos in the Repos panel with `space` (or cmd-click), or mark every listed repo with `a`.
 The count shows in the panel title, and `esc` clears the marks. Actions started from the Repos
 panel then run on every marked repo at once. With nothing marked, they run on the selected repo.
-Only listed repos count: a mark the filter or a collapsed group hides isn't acted on.
+Only listed repos count: a mark the filter or a collapsed group hides isn't acted on. With
+every mark hidden the action stops and says so, rather than falling back to the selected repo.
 
 - `c` checks out a branch by name. It uses the local branch, or creates one tracking
   `origin/<name>`.

@@ -39,12 +39,24 @@ impl Workspace {
 
     /// Marked repos in Repos-panel order, when the action starts from the Repos panel. Only
     /// listed ones count: a mark hidden by the filter or a collapsed group isn't acted on.
+    /// Empty when every mark is hidden: the action has to stop there, since falling back to
+    /// the selected repo would act on one the user never marked.
     pub(crate) fn marked_targets(&self, cx: &App) -> Option<Vec<PathBuf>> {
-        if self.focused != Panel::Repos {
+        if self.focused != Panel::Repos || self.marked.is_empty() {
             return None;
         }
-        let marked = self.listed_marked(cx);
-        (!marked.is_empty()).then_some(marked)
+        Some(self.listed_marked(cx))
+    }
+
+    /// Says why an action with marks to act on has nothing to do: they're all out of sight.
+    pub(crate) fn no_listed_marks(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let hidden = self.marked.len();
+        let message = format!(
+            "{hidden} marked {} hidden by the filter or a collapsed group, so there's nothing to act on.\n\n\
+             Clear the filter, press z to show a repo's worktrees, or esc to clear the marks.",
+            if hidden == 1 { "repository is" } else { "repositories are" }
+        );
+        self.show_message(title, message, window, cx);
     }
 
     /// Marked repos that are listed, in Repos-panel order.
@@ -68,6 +80,15 @@ impl Workspace {
     fn targets(&self, cx: &App) -> Vec<PathBuf> {
         self.marked_targets(cx)
             .unwrap_or_else(|| self.selected_root(cx).into_iter().collect())
+    }
+
+    /// [`Self::targets`], or `None` with a message when every marked repo is hidden.
+    fn action_targets(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<Vec<PathBuf>> {
+        if self.marked_targets(cx).is_some_and(|roots| roots.is_empty()) {
+            self.no_listed_marks(title, window, cx);
+            return None;
+        }
+        Some(self.targets(cx))
     }
 
     /// "billing" or "3 repos", for prompt titles.
@@ -114,7 +135,7 @@ impl Workspace {
     // ---- actions ------------------------------------------------------------------------------
 
     pub fn checkout_by_name(&mut self, _: &CheckoutByName, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("Check out branch", window, cx) else { return };
         if targets.is_empty() {
             return;
         }
@@ -154,7 +175,7 @@ impl Workspace {
     }
 
     pub fn new_branch_in_repos(&mut self, _: &NewBranchInRepos, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("New branch", window, cx) else { return };
         if targets.is_empty() {
             return;
         }
@@ -187,7 +208,7 @@ impl Workspace {
     }
 
     pub fn switch_to_default(&mut self, _: &SwitchToDefault, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("Default branch", window, cx) else { return };
         let run = move |this: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
             this.run_batch(
                 "Default branch",
@@ -307,6 +328,9 @@ impl Workspace {
             );
         }
         let marked = self.marked_targets(cx);
+        if marked.as_ref().is_some_and(|roots| roots.is_empty()) {
+            return self.no_listed_marks("Fast-forward", window, cx);
+        }
         let roots = marked.clone().unwrap_or_else(|| {
             self.listed_roots(cx)
                 .into_iter()
