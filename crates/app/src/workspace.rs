@@ -1008,9 +1008,9 @@ impl Workspace {
     /// Moves the overview's cursor among the PRs to the one `to` picks from the current one
     /// and how many there are.
     fn move_overview(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        // Titles don't matter here.
-        let rows = self.overview_rows(store, 80);
+        // Titles don't matter here: the width only cuts text, it never changes how many
+        // rows there are or which of them are PRs, so these line up with what's drawn.
+        let rows = self.overview_rows(self.store.read(cx), 80);
         let prs: Vec<usize> = (0..rows.len()).filter(|&ix| rows[ix].pr.is_some()).collect();
         if prs.is_empty() {
             return;
@@ -1020,12 +1020,17 @@ impl Workspace {
             .and_then(|row| prs.iter().position(|&ix| ix == row))
             .unwrap_or(0);
         let next = to(current, prs.len()).min(prs.len() - 1);
+        self.select_overview_pr(&rows, &prs, next, cx);
+    }
+
+    /// Puts the overview's cursor on `prs[next]`, an index into the PR rows of `rows`.
+    fn select_overview_pr(&mut self, rows: &[overview::Row], prs: &[usize], next: usize, cx: &mut Context<Self>) {
         let row = prs[next];
         self.overview_selected[self.overview_tab] = (rows[row].pr.as_ref().map(|pr| pr.id.clone()), next);
         // The first PR's header stays in view.
         let shown = if next == 0 { 0 } else { row };
         self.main.scroll.scroll_to_item(shown, ScrollStrategy::Nearest);
-        self.want_overview_detail(cx);
+        self.want_detail_of(rows, cx);
         cx.notify();
     }
 
@@ -1034,11 +1039,10 @@ impl Workspace {
         if self.focused != Panel::Main {
             self.focus_panel(Panel::Main, window, cx);
         }
-        let store = self.store.read(cx);
-        let rows = self.overview_rows(store, 80);
+        let rows = self.overview_rows(self.store.read(cx), 80);
         let prs: Vec<usize> = (0..rows.len()).filter(|&ix| rows[ix].pr.is_some()).collect();
         if let Some(index) = prs.iter().position(|&ix| ix == row) {
-            self.move_overview(|_, _| index, cx);
+            self.select_overview_pr(&rows, &prs, index, cx);
         }
     }
 
@@ -1047,9 +1051,17 @@ impl Workspace {
         if self.current_view() != View::Overview {
             return;
         }
-        let store = self.store.read(cx);
-        let rows = self.overview_rows(store, 80);
-        let Some(id) = self.overview_cursor(&rows).and_then(|row| rows[row].pr.as_ref()).map(|pr| pr.id.clone()) else {
+        let rows = self.overview_rows(self.store.read(cx), 80);
+        self.want_detail_of(&rows, cx);
+    }
+
+    /// The same, for rows the caller has built already: listing them walks every repo's
+    /// PRs, so a keystroke shouldn't do it more than once.
+    fn want_detail_of(&mut self, rows: &[overview::Row], cx: &mut Context<Self>) {
+        if self.current_view() != View::Overview {
+            return;
+        }
+        let Some(id) = self.overview_cursor(rows).and_then(|row| rows[row].pr.as_ref()).map(|pr| pr.id.clone()) else {
             return;
         };
         self.store.update(cx, |store, cx| store.want_detail(&id, cx));

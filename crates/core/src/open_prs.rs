@@ -31,9 +31,12 @@ pub const PRS_PER_REPO: usize = 30;
 pub const SELECTED_MAX_AGE: Duration = Duration::from_secs(60);
 /// A push shows on GitHub, and starts its checks, a moment later.
 pub const AFTER_PUSH: Duration = Duration::from_secs(5);
-/// GitHub's search for the PRs asking for the user's review, their teams' included.
-pub const REVIEW_SEARCH: &str = "is:open is:pr review-requested:@me archived:false";
-/// Review requests asked for per host. Only those in the workdir's repos show.
+/// GitHub's search for the PRs asking for the user's review, their teams' included. Sorted
+/// explicitly: the search covers the whole host, so [`REVIEW_RESULTS`] is a cut, and
+/// GitHub's default relevance order would make which PRs fall inside it vary between rounds.
+pub const REVIEW_SEARCH: &str = "is:open is:pr review-requested:@me archived:false sort:updated-desc";
+/// Review requests asked for per host. Only those in the workdir's repos show. A request
+/// past this cut still shows, under whoever wrote it rather than as waiting on the user.
 const REVIEW_RESULTS: usize = 50;
 
 /// An open pull request, as the overview lists it.
@@ -509,9 +512,12 @@ pub enum Checkout<'a> {
 /// repo; one without an upstream, when it has the same name and would be pushed there.
 pub fn checkout<'a>(pr: &OpenPr, local: &LocalRepo, checkouts: &[(&'a str, Option<&str>)]) -> Option<Checkout<'a>> {
     let head_repo = pr.head_repo.as_deref()?;
+    // Split once: this runs for every branch of every repo, for every PR listed.
+    let (head_owner, head_name) = head_repo.split_once('/')?;
     let is_head = |repo: &Option<RemoteRepo>| {
-        repo.as_ref()
-            .is_some_and(|repo| format!("{}/{}", repo.owner, repo.name).eq_ignore_ascii_case(head_repo))
+        repo.as_ref().is_some_and(|repo| {
+            repo.owner.eq_ignore_ascii_case(head_owner) && repo.name.eq_ignore_ascii_case(head_name)
+        })
     };
     let remote_is_head = |name: &str| {
         local
@@ -680,7 +686,10 @@ impl OpenQueue {
             return OpenNext::Idle;
         }
         if std::mem::take(&mut self.round) {
-            self.repos.clear();
+            // A round asks about every repo as GitHub sees it now, so it covers the repos
+            // already due. One queued for later isn't: a push GitHub hasn't seen yet needs
+            // the lookup this round is too early for.
+            self.repos.retain(|_, at| *at > now);
             self.running = true;
             return OpenNext::Start {
                 round: true,
@@ -1262,6 +1271,18 @@ if [ -e "$dir/answer$n" ]; then cat "$dir/answer$n"; else echo 'gh: HTTP 502' >&
         assert_eq!(queue.next(true, secs(3)), OpenNext::Start { round: false, repos: vec!["c".into()] });
         queue.finished();
         assert_eq!(queue.next(true, secs(9)), OpenNext::Idle);
+
+        // A round covers the repos due by now, but not one queued for later: a push
+        // GitHub hasn't seen yet still needs its own lookup after the round.
+        queue.repo("d".into(), secs(9));
+        queue.repo("e".into(), secs(14));
+        queue.round();
+        assert_eq!(queue.next(true, secs(9)), OpenNext::Start { round: true, repos: vec![] });
+        queue.finished();
+        assert_eq!(queue.next(true, secs(10)), OpenNext::Wait(secs(14)));
+        assert_eq!(queue.next(true, secs(14)), OpenNext::Start { round: false, repos: vec!["e".into()] });
+        queue.finished();
+        assert_eq!(queue.next(true, secs(15)), OpenNext::Idle);
     }
 
     #[test]
