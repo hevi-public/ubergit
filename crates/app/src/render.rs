@@ -12,6 +12,7 @@ use ubergit_core::{CmdKind, FileKind, Head, RepoSummary, Upstream};
 
 use crate::batch::{BatchRow, Outcome, headline};
 use crate::keymap::{self, *};
+use crate::overview;
 use crate::pr;
 use crate::store::{RepoEntry, RepoStore};
 use crate::text::{Line, age, truncate};
@@ -458,7 +459,7 @@ impl Workspace {
                 line.color(format!("{} ", s.index), Palette::dim());
                 line.push(&s.subject);
             }
-            View::Repos | View::Status | View::Main | View::Staging => {}
+            View::Repos | View::Status | View::Main | View::Staging | View::Overview => {}
         }
         line
     }
@@ -621,7 +622,10 @@ impl Workspace {
                     MainContent::Text { lines, kind } => text_list("main", lines.clone(), *kind, &self.main.scroll),
                     MainContent::File { .. } => unreachable!(),
                 };
-                let title = main_title(&self.main.title, active);
+                let title = match content {
+                    MainContent::Overview => self.overview_title(active),
+                    _ => main_title(&self.main.title, active),
+                };
                 self.frame(title, active, None, body).size_full()
             }
         }
@@ -669,57 +673,95 @@ impl Workspace {
         .into_any_element()
     }
 
-    /// All repos at a glance: the dashboard shown while the Repos panel is focused.
+    /// Open pull requests, the main view while the Repos panel is focused: the selected
+    /// repo's, or every repo's in the inbox. With the focus here (`0`), a cursor picks one,
+    /// and its detail shows below the list.
     fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
-        let visible = self.visible(View::Repos, store);
-        let tree = store.repos.iter().any(|r| r.main_repo.is_some());
-        let name_w = (0..visible.len())
-            .map(|pos| overview_name(store, &visible, pos, tree, None).width())
-            .max()
-            .unwrap_or(4)
-            .clamp(4, 40);
-        let count = visible.len() + 1;
-        uniform_list(
+        // The main column's width in characters, less the frame and the rows' padding. The
+        // other screen modes only make it wider.
+        let width = self
+            .layout
+            .columns
+            .read(cx)
+            .sizes()
+            .get(2)
+            .filter(|w| **w > px(0.))
+            .map_or(100, |w| ((*w - COLUMN_GAP - px(2. + 6. + 8.)) / CHAR_WIDTH) as usize);
+        let rows = self.overview_rows(store, width);
+        let cursor = self.overview_cursor(&rows);
+        let detail = cursor
+            .and_then(|row| rows[row].pr.as_ref())
+            .map(|row| overview::detail(store, row, width));
+        let active = self.is_active(Panel::Main);
+        let lines: Arc<Vec<Line>> = Arc::new(rows.into_iter().map(|row| row.line).collect());
+        let list = uniform_list(
             "overview",
-            count,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
-                let store = this.store.read(cx);
-                let visible = this.visible(View::Repos, store);
-                let cursor = this.cursor(View::Repos, visible.len());
-                let marks = !this.marked.is_empty();
-                let prs = pr::column_shown(&store.gh_status);
+            lines.len(),
+            cx.processor(move |_, range: Range<usize>, _, cx| {
                 range
-                    .map(|pos| {
-                        let mut line = Line::new();
-                        if pos == 0 {
-                            if marks {
-                                line.push("  ");
-                            }
-                            line.append(overview_header(name_w, prs));
-                        } else if let Some(&ix) = visible.get(pos - 1) {
-                            let entry = &store.repos[ix];
-                            if marks {
-                                mark_column(&mut line, this.marked.contains(&entry.location.root));
-                            }
-                            let name = overview_name(store, &visible, pos - 1, tree, Some(name_w));
-                            line.append(overview_row(entry, name, prs.then(|| store.pr_view(entry))));
-                        }
+                    .map(|ix| {
                         div()
-                            .id(pos)
+                            .id(ix)
                             .h(LINE_HEIGHT)
                             .px(px(4.))
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .when(pos > 0 && pos - 1 == cursor, |d| d.bg(Palette::inactive_selection()))
-                            .child(line.build())
+                            .when(cursor == Some(ix), |d| {
+                                d.bg(if active { Palette::selection() } else { Palette::inactive_selection() })
+                            })
+                            .child(lines[ix].build())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    this.click_overview_row(ix, window, cx)
+                                }),
+                            )
                     })
                     .collect::<Vec<_>>()
             }),
         )
         .track_scroll(&self.main.scroll)
-        .size_full()
-        .into_any_element()
+        .size_full();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h(px(0.)).child(list))
+            .when_some(detail, |d, detail| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(Palette::inactive_border())
+                        .pt(px(4.))
+                        .px(px(4.))
+                        .children(detail.into_iter().map(|line| {
+                            div().h(LINE_HEIGHT).whitespace_nowrap().overflow_hidden().child(line.build())
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// `[0]─This repo - Inbox`, with the current tab highlighted.
+    fn overview_title(&self, active: bool) -> Line {
+        let mut line = Line::new();
+        line.color("[0]", Palette::dim());
+        line.color("─", if active { Palette::active_border() } else { Palette::inactive_border() });
+        for (ix, tab) in overview::TABS.iter().enumerate() {
+            if ix > 0 {
+                line.push(" - ");
+            }
+            if ix != self.overview_tab {
+                line.push(tab);
+            } else if active {
+                line.bold(tab, Palette::active_border());
+            } else {
+                line.color(tab, Palette::active_border());
+            }
+        }
+        line
     }
 
     fn status_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1475,129 +1517,6 @@ fn mark_column(line: &mut Line, marked: bool) {
     }
 }
 
-/// The overview's column titles; `prs` adds the PR column.
-fn overview_header(name_w: usize, prs: bool) -> Line {
-    let mut line = Line::new();
-    let mut header = format!("  {:<name_w$}  {:<22} ", "REPO", "BRANCH");
-    if prs {
-        header.push_str(&format!("{:<18} ", "PR"));
-    }
-    header.push_str(&format!(
-        "{:<9} {:<16} {:<16} {:>5}  {:<7} {}",
-        "UPSTREAM", "VS DEFAULT", "CHANGES", "STASH", "FETCHED", "STATE"
-    ));
-    line.bold(header, Palette::dim());
-    line
-}
-
-/// The overview's name cell for `visible[pos]`, `width` wide (`None`: as wide as it needs):
-/// like the Repos panel's name, with a collapsed group's summary in it, where the row's
-/// end would be out of sight.
-fn overview_name(store: &RepoStore, visible: &[usize], pos: usize, tree: bool, width: Option<usize>) -> Line {
-    let ix = visible[pos];
-    let open = group_open(store, visible, pos);
-    let marker = if tree { tree_marker(store, ix, open) } else { "" };
-    let summary = (!open && !store.worktrees_of(ix).is_empty()).then(|| group_summary(store, ix));
-    let room = width.map_or(usize::MAX, |width| {
-        width.saturating_sub(marker.chars().count() + summary.as_ref().map_or(0, Line::width))
-    });
-    let mut line = Line::new();
-    line.color(marker, Palette::dim());
-    line.push(truncate(&store.repos[ix].short_name(), room));
-    if let Some(summary) = summary {
-        line.append(summary);
-    }
-    line.pad_to(width.unwrap_or(0));
-    line
-}
-
-/// One repo's overview line, after `name`, its name cell, with a PR cell when given what
-/// to show for its PR.
-fn overview_row(entry: &RepoEntry, name: Line, pr: Option<PrView>) -> Line {
-    let mut line = Line::new();
-    let (glyph, color) = match &entry.summary {
-        _ if entry.error.is_some() => ("⚠", Palette::red()),
-        Some(s) => health(s, entry.fetch_error.is_some()),
-        None => ("·", Palette::dim()),
-    };
-    line.color(glyph, color);
-    line.push(" ");
-    line.append(name);
-    line.push("  ");
-    let Some(s) = &entry.summary else {
-        if let Some(err) = &entry.error {
-            line.color(truncate(err.lines().next().unwrap_or(""), 80), Palette::red());
-        }
-        return line;
-    };
-    let branch = match &s.head {
-        Head::Branch(b) | Head::Unborn(b) => truncate(b, 22),
-        Head::Detached(oid) => format!("@{}", oid.get(..7).unwrap_or(oid)),
-    };
-    line.color(format!("{branch:<22} "), if matches!(s.head, Head::Detached(_)) { Palette::yellow() } else { Palette::blue() });
-    // Next to the branch it's for, and early enough that long repo names don't push it
-    // out of the window.
-    if let Some(pr) = pr {
-        // Blank for a repo that can't be read: its summary, and so its branch, may be old.
-        let mut cell = if entry.error.is_some() { Line::new() } else { pr::cell(&pr) };
-        cell.pad_to(18).push(" ");
-        line.append(cell);
-    }
-    let (upstream, up_color) = match &s.upstream {
-        Upstream::None => ("-".to_string(), Palette::dim()),
-        Upstream::Gone { .. } => ("gone".to_string(), Palette::red()),
-        Upstream::Tracking { ahead: 0, behind: 0, .. } => ("✓".to_string(), Palette::green()),
-        Upstream::Tracking { ahead, behind, .. } => (arrows(*ahead, *behind), Palette::yellow()),
-    };
-    line.color(format!("{upstream:<9} "), up_color);
-    let (base, base_color) = match &s.base {
-        None => ("-".to_string(), Palette::dim()),
-        Some(b) if b.ahead == 0 && b.behind == 0 => (format!("{} ✓", short_base(&b.base)), Palette::green()),
-        Some(b) => (format!("{} {}", short_base(&b.base), arrows(b.ahead, b.behind)), Palette::magenta()),
-    };
-    line.color(format!("{:<16} ", truncate(&base, 16)), base_color);
-    let c = s.changes;
-    let changes = if c.files == 0 {
-        "clean".to_string()
-    } else {
-        let mut parts = Vec::new();
-        if c.staged > 0 {
-            parts.push(format!("+{}", c.staged));
-        }
-        if c.unstaged > 0 {
-            parts.push(format!("~{}", c.unstaged));
-        }
-        if c.untracked > 0 {
-            parts.push(format!("?{}", c.untracked));
-        }
-        if c.conflicted > 0 {
-            parts.push(format!("!{}", c.conflicted));
-        }
-        parts.join(" ")
-    };
-    let changes_color = if c.conflicted > 0 {
-        Palette::red()
-    } else if c.files > 0 {
-        Palette::yellow()
-    } else {
-        Palette::dim()
-    };
-    line.color(format!("{changes:<16} "), changes_color);
-    line.color(format!("{:>5}  ", if s.stash_count > 0 { s.stash_count.to_string() } else { "-".into() }), Palette::dim());
-    let fetched = if s.last_fetch.is_some() { age(s.last_fetch) } else { "never".into() };
-    line.color(format!("{fetched:<7} "), if entry.fetch_error.is_some() { Palette::red() } else { Palette::dim() });
-    if let Some(busy) = &entry.busy {
-        line.color(format!("{busy}…"), Palette::cyan());
-    } else if let Some(op) = &s.op {
-        line.color(op.label(), Palette::yellow());
-    } else if let Some(err) = &entry.fetch_error {
-        line.color(format!("fetch failed: {}", truncate(err, 60)), Palette::red());
-    } else if s.shallow {
-        line.color("shallow", Palette::dim());
-    }
-    line
-}
-
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -1610,10 +1529,6 @@ fn truncate_left(s: &str, max: usize) -> String {
     } else {
         format!("…{}", s.chars().skip(count - max + 1).collect::<String>())
     }
-}
-
-fn short_base(base: &str) -> &str {
-    base.rsplit('/').next().unwrap_or(base)
 }
 
 fn main_title(title: &str, active: bool) -> Line {
@@ -1755,6 +1670,7 @@ fn hints(view: View) -> String {
             ("Fetch all", "F"),
             ("Update", "U"),
             ("PR", "G"),
+            ("Tabs", "[/]"),
         ],
         View::Files => &[
             ("Stage", "<space>"),
@@ -1777,6 +1693,7 @@ fn hints(view: View) -> String {
         View::Tags | View::Commits => &[("Checkout", "<space>"), ("View", "<enter>")],
         View::Stash => &[("Apply", "<space>"), ("Pop", "g"), ("Drop", "d"), ("Rename", "r"), ("Branch", "n")],
         View::Main => &[("Scroll", "j/k"), ("Back", "<esc>")],
+        View::Overview => &[("Select", "j/k"), ("Open PR", "G"), ("Tab", "[/]"), ("Back", "<esc>")],
         _ => &[("Push", "P"), ("Pull", "p"), ("Fetch", "f"), ("PR", "G")],
     };
     let mut out: Vec<String> = parts.iter().map(|(what, key)| format!("{what}: {key}")).collect();

@@ -1,8 +1,8 @@
 //! `RepoStore`: every repo's live summary, the selected repo's detail, the command
 //! log, and the background work that keeps them fresh (watcher, poller, auto-fetch,
-//! PR lookups).
+//! PR lookups, and the overview's open PRs).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -10,11 +10,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::{AppContext as _, Context, SharedString, Task};
 use ubergit_core::detail::{self, RepoDetail};
+use ubergit_core::github;
+use ubergit_core::open_prs::{self, Listing, LocalRepo, OpenLookups, OpenNext, OpenQueue, ReviewRequest};
 use ubergit_core::pr_status::{self, Answer, GhStatus, Lookups, Next, PrQueue, PrView, RepoPr, Request};
 use ubergit_core::watch::{self, RepoWatcher, WatchEvent};
 use ubergit_core::{
-    CmdKind, CommandRecord, CommandSink, Config, Gh, Git, GitError, GitOutput, RepoLocation, RepoSummary,
-    discovery, ops, summary,
+    CmdKind, CommandRecord, CommandSink, Config, Gh, Git, GitError, GitOutput, PullRequest, RepoLocation,
+    RepoSummary, discovery, ops, summary,
 };
 
 const LOG_CAPACITY: usize = 500;
@@ -72,6 +74,46 @@ pub struct Detail {
     pub error: Option<String>,
 }
 
+/// A repo's open PRs, for the overview. Its worktrees share them: they're kept for its
+/// main checkout.
+#[derive(Default)]
+pub struct RepoOpen {
+    /// Its remotes and branches, to tell where each PR is checked out.
+    pub local: Option<LocalRepo>,
+    /// The latest answer; a failed lookup leaves it as it was.
+    pub listing: Option<Listing>,
+    /// Set when the latest lookup failed, and when.
+    pub error: Option<(String, SystemTime)>,
+    /// When `listing` came.
+    pub checked: Option<SystemTime>,
+}
+
+/// What a host said for the inbox.
+#[derive(Default)]
+pub struct HostOpen {
+    /// Who gh is logged in as there.
+    pub viewer: Option<String>,
+    /// The PRs asking for the user's review, from the last search that worked.
+    pub review: Option<Vec<ReviewRequest>>,
+    /// Set when the latest search failed.
+    pub review_error: Option<String>,
+}
+
+/// One PR, wherever it's listed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PrId {
+    pub host: String,
+    /// `owner/name`.
+    pub repo: String,
+    pub number: u64,
+}
+
+/// A PR looked up in full: its reviews and the names of its checks.
+pub struct PrDetail {
+    pub result: Result<PullRequest, String>,
+    pub checked: SystemTime,
+}
+
 pub struct RepoStore {
     pub workdir: PathBuf,
     pub config: Config,
@@ -97,6 +139,18 @@ pub struct RepoStore {
     pr_wake: Option<Task<()>>,
     /// When every repo's PR was last queued, by the timer or `R`.
     last_pr_round: Instant,
+    /// Each repo's open PRs, by its main checkout's root.
+    pub open: HashMap<PathBuf, RepoOpen>,
+    /// Each host's viewer and review requests.
+    pub open_hosts: BTreeMap<String, HostOpen>,
+    open_queue: OpenQueue,
+    /// Calls [`Self::pump_open`] again when a pushed repo is due.
+    open_wake: Option<Task<()>>,
+    /// PRs selected in the overview, looked up in full.
+    pub pr_details: HashMap<PrId, PrDetail>,
+    /// The PR being looked up in full, and the one to look up after it.
+    detail_running: Option<PrId>,
+    detail_next: Option<PrId>,
     watcher: Option<RepoWatcher>,
     watch_tx: async_channel::Sender<WatchEvent>,
     _tasks: Vec<Task<()>>,
@@ -204,6 +258,18 @@ impl RepoStore {
             pr_wake: None,
             // The first summaries queue every repo, which makes the first round.
             last_pr_round: Instant::now(),
+            open: HashMap::new(),
+            open_hosts: BTreeMap::new(),
+            // Waits for the first lookup to find gh's hosts.
+            open_queue: {
+                let mut queue = OpenQueue::default();
+                queue.round();
+                queue
+            },
+            open_wake: None,
+            pr_details: HashMap::new(),
+            detail_running: None,
+            detail_next: None,
             watcher: None,
             watch_tx,
             _tasks: tasks,
@@ -401,6 +467,12 @@ impl RepoStore {
         }
         self.selected = root;
         self.load_detail(cx);
+        if let Some(group) = self.selected_entry().map(|entry| self.group_root(entry).to_path_buf())
+            && open_prs::stale(self.open.get(&group).and_then(|open| open.checked), SystemTime::now())
+        {
+            self.open_queue.repo(group, Instant::now());
+            self.pump_open(cx);
+        }
         cx.notify();
     }
 
@@ -565,6 +637,8 @@ impl RepoStore {
         if self.pr_queue.refresh(roots, self.last_pr_round.elapsed()) {
             self.last_pr_round = Instant::now();
             self.pump_prs(cx);
+            // It starts once the lookup has checked gh's hosts again.
+            self.open_queue.round();
         }
     }
 
@@ -587,6 +661,8 @@ impl RepoStore {
         let roots: Vec<PathBuf> = self.repos.iter().map(|r| r.location.root.clone()).collect();
         self.pr_queue.round(roots, &self.gh_status);
         self.pump_prs(cx);
+        self.open_queue.round();
+        self.pump_open(cx);
         interval
     }
 
@@ -680,6 +756,8 @@ impl RepoStore {
                 this.apply_pr_lookups(found);
                 this.pr_queue.finished();
                 this.pump_prs(cx);
+                // gh's hosts may be known now.
+                this.pump_open(cx);
                 cx.notify();
             })
             .ok();
@@ -709,6 +787,151 @@ impl RepoStore {
             log::debug!("PR of {} ({}): {}", entry.name(), answered.key.branch, describe(&answered.answer));
             entry.pr.record(answered, now);
         }
+    }
+
+    // ---- the overview's open PRs --------------------------------------------------------
+
+    /// The main checkout whose open PRs a repo shows: its own root, or for a grouped
+    /// worktree, its main checkout's.
+    pub fn group_root<'a>(&self, entry: &'a RepoEntry) -> &'a Path {
+        entry.main_repo.as_deref().unwrap_or(&entry.location.root)
+    }
+
+    /// Looks up a pushed repo's open PRs again, once GitHub has seen the push.
+    pub fn pushed(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let Some(group) = self.entry(root).map(|entry| self.group_root(entry).to_path_buf()) else {
+            return;
+        };
+        self.open_queue.repo(group, Instant::now() + open_prs::AFTER_PUSH);
+        self.pump_open(cx);
+    }
+
+    /// Starts the next open-PR lookup, or wakes up when a pushed repo is due.
+    fn pump_open(&mut self, cx: &mut Context<Self>) {
+        let ready = self.gh_status.hosts().is_some();
+        match self.open_queue.next(ready, Instant::now()) {
+            OpenNext::Idle => {}
+            OpenNext::Wait(at) => {
+                let wait = at.saturating_duration_since(Instant::now());
+                self.open_wake = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    this.update(cx, |this, cx| this.pump_open(cx)).ok();
+                }));
+            }
+            OpenNext::Start { round, repos } => self.start_open_lookup(round, repos, cx),
+        }
+    }
+
+    fn start_open_lookup(&mut self, round: bool, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
+        // A round is every main checkout, and each worktree whose main checkout isn't listed.
+        let roots: Vec<PathBuf> = if round {
+            self.repos
+                .iter()
+                .filter(|entry| entry.main_repo.is_none())
+                .map(|entry| entry.location.root.clone())
+                .collect()
+        } else {
+            roots.into_iter().filter(|root| self.index_of(root).is_some()).collect()
+        };
+        let hosts = self.gh_status.hosts().map(<[String]>::to_vec);
+        let Some(hosts) = hosts.filter(|_| !roots.is_empty()) else {
+            self.open_queue.finished();
+            return;
+        };
+        log::debug!(
+            "looking up the open PRs of {} repos{}",
+            roots.len(),
+            if round { " and the review requests" } else { "" }
+        );
+        let (git, gh, workdir) = (self.git.clone(), self.gh.clone(), self.workdir.clone());
+        let task =
+            cx.background_spawn(async move { open_prs::refresh(&git, &gh, &workdir, &hosts, roots, round).await });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            this.update(cx, |this, cx| {
+                this.apply_open(found);
+                this.open_queue.finished();
+                this.pump_open(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_open(&mut self, found: OpenLookups) {
+        if let Some(status) = found.gh {
+            self.gh_status = status;
+        }
+        let now = SystemTime::now();
+        for answer in found.repos {
+            let open = self.open.entry(answer.root).or_default();
+            if let Ok(local) = answer.local {
+                open.local = Some(local);
+            }
+            match answer.listing {
+                Listing::NotAsked => {}
+                Listing::Failed(message) => open.error = Some((message, now)),
+                listing => {
+                    open.listing = Some(listing);
+                    open.error = None;
+                    open.checked = Some(now);
+                }
+            }
+        }
+        for answer in found.hosts {
+            let host = self.open_hosts.entry(answer.host).or_default();
+            if answer.viewer.is_some() {
+                host.viewer = answer.viewer;
+            }
+            match answer.review {
+                Some(Ok(found)) => {
+                    host.review = Some(found);
+                    host.review_error = None;
+                }
+                Some(Err(message)) => host.review_error = Some(message),
+                None => {}
+            }
+        }
+    }
+
+    /// Looks up a PR selected in the overview in full, unless that was done less than a
+    /// minute ago. One at a time: the latest one asked for goes next.
+    pub fn want_detail(&mut self, id: &PrId, cx: &mut Context<Self>) {
+        let fresh = self
+            .pr_details
+            .get(id)
+            .is_some_and(|detail| !open_prs::stale(Some(detail.checked), SystemTime::now()));
+        if fresh || self.detail_running.as_ref() == Some(id) {
+            return;
+        }
+        if self.detail_running.is_some() {
+            self.detail_next = Some(id.clone());
+            return;
+        }
+        // Only a host gh is logged in to.
+        if !self.gh_status.hosts().is_some_and(|hosts| hosts.contains(&id.host)) {
+            return;
+        }
+        self.detail_running = Some(id.clone());
+        let (gh, workdir, id) = (self.gh.clone(), self.workdir.clone(), id.clone());
+        let asked = id.clone();
+        let task = cx.background_spawn(async move {
+            github::pr_detail(&gh, &asked.host, &asked.repo, asked.number, &workdir).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|err| Err(err.to_string()));
+            this.update(cx, |this, cx| {
+                this.pr_details.insert(id, PrDetail { result, checked: SystemTime::now() });
+                this.detail_running = None;
+                if let Some(next) = this.detail_next.take() {
+                    this.want_detail(&next, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 

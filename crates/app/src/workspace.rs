@@ -18,8 +18,9 @@ use ubergit_core::{FileKind, Git, GitError, GitOutput, Head, RepoLocation, Upstr
 
 use crate::batch::BatchRow;
 use crate::keymap::*;
+use crate::overview;
 use crate::pr::{self, OpenAction};
-use crate::store::RepoStore;
+use crate::store::{PrId, RepoStore};
 use crate::theme::LINE_HEIGHT;
 use crate::ui_state::{self, SavedLayout, SavedWindow, UiState, WorkdirState};
 
@@ -86,6 +87,8 @@ pub enum View {
     Main,
     /// The main view on a file's diff, with a cursor for staging lines (`enter` in Files).
     Staging,
+    /// The main view on the overview's open PRs, with a cursor on one (`0` from Repos).
+    Overview,
 }
 
 impl View {
@@ -104,11 +107,12 @@ impl View {
             View::Stash => "Stash",
             View::Main => "Main",
             View::Staging => "Staging",
+            View::Overview => "Overview",
         }
     }
 
     pub fn is_list(self) -> bool {
-        !matches!(self, View::Status | View::Main | View::Staging)
+        !matches!(self, View::Status | View::Main | View::Staging | View::Overview)
     }
 
     /// Lists that belong to the selected repo (reset when switching repos).
@@ -355,6 +359,11 @@ pub struct Workspace {
     pub expanded: BTreeSet<PathBuf>,
     /// Identifies the multi-repo action whose results popup is showing.
     pub(crate) last_batch: u64,
+    /// The overview's tab ([`overview::TABS`]).
+    pub overview_tab: usize,
+    /// The PR selected in each overview tab, and its row among the PRs, where the cursor
+    /// stays when that PR is gone.
+    overview_selected: [(Option<PrId>, usize); 2],
     /// Where the UI state is saved (`None`: it isn't), and what was saved last.
     state_path: Option<PathBuf>,
     last_saved: Option<UiState>,
@@ -469,6 +478,8 @@ impl Workspace {
             marked: HashSet::new(),
             expanded: saved_workdir.expanded_repos,
             last_batch: 0,
+            overview_tab: saved.overview_tab.min(overview::TABS.len() - 1),
+            overview_selected: Default::default(),
             state_path,
             last_saved: None,
             window_placement: SavedWindow::capture(window, cx, saved.window.as_ref()),
@@ -505,6 +516,8 @@ impl Workspace {
     pub fn current_view(&self) -> View {
         if self.focused == Panel::Main && self.staging.path.is_some() {
             View::Staging
+        } else if self.focused == Panel::Main && self.last_side == Panel::Repos {
+            View::Overview
         } else {
             self.view_of(self.focused)
         }
@@ -534,7 +547,7 @@ impl Workspace {
             View::Commits => detail.commits.len(),
             View::Reflog => detail.reflog.len(),
             View::Stash => detail.stashes.len(),
-            View::Status | View::Main | View::Staging => 0,
+            View::Status | View::Main | View::Staging | View::Overview => 0,
         }
     }
 
@@ -750,6 +763,7 @@ impl Workspace {
             self.store.update(cx, |store, cx| store.select(root, cx));
         }
         self.sync_main(cx);
+        self.want_overview_detail(cx);
         cx.notify();
     }
 
@@ -799,6 +813,7 @@ impl Workspace {
                 .filter(|panel| panel.tabs().len() > 1)
                 .map(|panel| (panel, self.tab(panel)))
                 .collect(),
+            overview_tab: self.overview_tab,
             workdirs: BTreeMap::from([(
                 workdir,
                 WorkdirState { selected_repo, expanded_repos: self.expanded.clone() },
@@ -888,7 +903,7 @@ impl Workspace {
                 let text = format!("Submodule: {}\nCommit:    {}\nState:     {state}", sm.path, sm.short_oid);
                 (MainKey::Message(text), "Submodule".into())
             }
-            View::Repos | View::Status | View::Main | View::Staging => (MainKey::Overview, "".into()),
+            View::Repos | View::Status | View::Main | View::Staging | View::Overview => (MainKey::Overview, "".into()),
         }
     }
 
@@ -967,6 +982,77 @@ impl Workspace {
         scroll_to_edge(&self.main.scroll, bottom);
         scroll_to_edge(&self.main.scroll2, bottom);
         cx.notify();
+    }
+
+    // ---- overview ------------------------------------------------------------------------------
+
+    /// The overview's rows in its current tab, titles cut to `width` characters.
+    pub fn overview_rows(&self, store: &RepoStore, width: usize) -> Vec<overview::Row> {
+        overview::rows(store, self.overview_tab, width)
+    }
+
+    /// The row of the PR selected in the overview, while the main view has the focus there.
+    /// It stays on its PR as the list changes, or on its place when that PR is gone.
+    pub fn overview_cursor(&self, rows: &[overview::Row]) -> Option<usize> {
+        if self.current_view() != View::Overview {
+            return None;
+        }
+        let prs: Vec<usize> = (0..rows.len()).filter(|&ix| rows[ix].pr.is_some()).collect();
+        let (id, index) = &self.overview_selected[self.overview_tab];
+        let by_id = id
+            .as_ref()
+            .and_then(|id| prs.iter().copied().find(|&ix| rows[ix].pr.as_ref().is_some_and(|row| row.id == *id)));
+        by_id.or_else(|| prs.get((*index).min(prs.len().checked_sub(1)?)).copied())
+    }
+
+    /// Moves the overview's cursor among the PRs to the one `to` picks from the current one
+    /// and how many there are.
+    fn move_overview(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        // Titles don't matter here.
+        let rows = self.overview_rows(store, 80);
+        let prs: Vec<usize> = (0..rows.len()).filter(|&ix| rows[ix].pr.is_some()).collect();
+        if prs.is_empty() {
+            return;
+        }
+        let current = self
+            .overview_cursor(&rows)
+            .and_then(|row| prs.iter().position(|&ix| ix == row))
+            .unwrap_or(0);
+        let next = to(current, prs.len()).min(prs.len() - 1);
+        let row = prs[next];
+        self.overview_selected[self.overview_tab] = (rows[row].pr.as_ref().map(|pr| pr.id.clone()), next);
+        // The first PR's header stays in view.
+        let shown = if next == 0 { 0 } else { row };
+        self.main.scroll.scroll_to_item(shown, ScrollStrategy::Nearest);
+        self.want_overview_detail(cx);
+        cx.notify();
+    }
+
+    /// A click on an overview row: selects its PR.
+    pub(crate) fn click_overview_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focused != Panel::Main {
+            self.focus_panel(Panel::Main, window, cx);
+        }
+        let store = self.store.read(cx);
+        let rows = self.overview_rows(store, 80);
+        let prs: Vec<usize> = (0..rows.len()).filter(|&ix| rows[ix].pr.is_some()).collect();
+        if let Some(index) = prs.iter().position(|&ix| ix == row) {
+            self.move_overview(|_, _| index, cx);
+        }
+    }
+
+    /// Looks up the selected overview PR in full: only that one, never every PR listed.
+    fn want_overview_detail(&mut self, cx: &mut Context<Self>) {
+        if self.current_view() != View::Overview {
+            return;
+        }
+        let store = self.store.read(cx);
+        let rows = self.overview_rows(store, 80);
+        let Some(id) = self.overview_cursor(&rows).and_then(|row| rows[row].pr.as_ref()).map(|pr| pr.id.clone()) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| store.want_detail(&id, cx));
     }
 
     // ---- staging view ----------------------------------------------------------------------
@@ -1252,6 +1338,13 @@ impl Workspace {
     }
 
     fn switch_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // The Repos panel has one tab; the overview it shows has two.
+        if self.focused == Panel::Repos || self.current_view() == View::Overview {
+            let count = overview::TABS.len() as isize;
+            self.overview_tab = (self.overview_tab as isize + delta).rem_euclid(count) as usize;
+            self.main.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            return self.after_change(cx);
+        }
         let panel = self.focused;
         let count = panel.tabs().len();
         if count > 1 {
@@ -1292,6 +1385,7 @@ impl Workspace {
         match self.current_view() {
             View::Main => self.scroll_main(delta, cx),
             View::Staging => self.step_staging(delta > 0, cx),
+            View::Overview => self.move_overview(|current, _| current.saturating_add_signed(delta), cx),
             View::Status => {}
             view => self.move_by(view, delta, cx),
         }
@@ -1306,7 +1400,7 @@ impl Workspace {
             Some(Some(scroll)) => visible_rows(scroll),
             Some(None) => return,
             None => match self.current_view() {
-                View::Main => visible_rows(&self.main.scroll),
+                View::Main | View::Overview => visible_rows(&self.main.scroll),
                 view => self.lists.get(&view).map_or(PAGE, |list| visible_rows(&list.scroll)),
             },
         };
@@ -1328,6 +1422,7 @@ impl Workspace {
         match self.current_view() {
             View::Main => self.scroll_main_to_edge(false, cx),
             View::Staging => self.move_staging(false, |patch, _| patch.first_change(), cx),
+            View::Overview => self.move_overview(|_, _| 0, cx),
             view if view.is_list() => self.move_cursor(view, |_, _| 0, cx),
             _ => {}
         }
@@ -1336,6 +1431,7 @@ impl Workspace {
         match self.current_view() {
             View::Main => self.scroll_main_to_edge(true, cx),
             View::Staging => self.move_staging(false, |patch, _| patch.adjacent_change(patch.len(), false), cx),
+            View::Overview => self.move_overview(|_, len| len - 1, cx),
             view if view.is_list() => self.move_cursor(view, |_, len| len - 1, cx),
             _ => {}
         }
@@ -1773,19 +1869,34 @@ impl Workspace {
             }
         };
         let force_push = push(true);
-        self.op_on_then(root.clone(), "Pushing", window, cx, push(false), move |this, err, window, cx| {
-            if ops::is_push_rejected(&err) {
-                this.confirm(
+        let task = self.store.update(cx, |store, cx| store.run_op(&root, "Pushing", push(false), cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(_) => this.store.update(cx, |store, cx| store.pushed(&root, cx)),
+                Err(err) if ops::is_push_rejected(&err) => this.confirm(
                     "Force push",
                     format!("{}\n\nForce push (with lease)?", err.details()),
                     window,
                     cx,
-                    move |this, window, cx| this.op_on(root, "Force pushing", window, cx, force_push),
-                );
-            } else {
-                this.show_error("Push", &err, window, cx);
-            }
-        });
+                    move |this, window, cx| {
+                        let task = this.store.update(cx, |store, cx| store.run_op(&root, "Force pushing", force_push, cx));
+                        cx.spawn_in(window, async move |this, cx| {
+                            let result = task.await;
+                            this.update_in(cx, |this, window, cx| match result {
+                                Ok(_) => this.store.update(cx, |store, cx| store.pushed(&root, cx)),
+                                Err(err) => this.show_error("Force pushing", &err, window, cx),
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    },
+                ),
+                Err(err) => this.show_error("Push", &err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn open_in_lazygit(&mut self, _: &OpenInLazygit, window: &mut Window, cx: &mut Context<Self>) {
@@ -1796,9 +1907,22 @@ impl Workspace {
         }
     }
 
-    /// `G`: the selected repo's PR in the browser, or GitHub's page for opening one, as
-    /// [`pr::open_action`] decides. Marks don't count.
+    /// `G`: the PR selected in the overview, or else the selected repo's PR in the browser,
+    /// or GitHub's page for opening one, as [`pr::open_action`] decides. Marks don't count.
     pub fn open_pull_request(&mut self, _: &OpenPullRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_view() == View::Overview {
+            let store = self.store.read(cx);
+            let rows = self.overview_rows(store, 80);
+            let url = self.overview_cursor(&rows).and_then(|row| rows[row].pr.as_ref()).map(|row| row.pr.url.clone());
+            match url.as_deref().map(pr::open_https) {
+                Some(OpenAction::Open(url)) => cx.open_url(&url),
+                Some(OpenAction::Message(message) | OpenAction::LookUp(message)) => {
+                    self.show_message("Pull request", message, window, cx)
+                }
+                None => {}
+            }
+            return;
+        }
         let Some(root) = self.selected_root(cx) else { return };
         let store = self.store.read(cx);
         let Some(entry) = store.entry(&root) else { return };

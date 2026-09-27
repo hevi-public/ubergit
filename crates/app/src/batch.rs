@@ -26,6 +26,9 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// The label of a push, which the overview's open PRs are looked up again after.
+const PUSHING: &str = "Pushing";
+
 pub struct BatchRow {
     pub name: String,
     pub outcome: Outcome,
@@ -260,7 +263,7 @@ impl Workspace {
         self.confirm("Push", message, window, cx, move |this, window, cx| {
             this.run_batch(
                 "Push",
-                "Pushing",
+                PUSHING,
                 roots,
                 |s| match (&s.head, &s.upstream) {
                     (Head::Detached(_), _) => Some(Outcome::Skipped("detached HEAD".into())),
@@ -405,6 +408,10 @@ impl Workspace {
             cx.spawn_in(window, async move |this, cx| {
                 let outcome = task.await.unwrap_or_else(|err| Outcome::Failed(err.details()));
                 this.update_in(cx, |this, window, cx| {
+                    // The overview's open PRs change with a push: their checks start.
+                    if label == PUSHING && matches!(outcome, Outcome::Done(_)) {
+                        this.store.update(cx, |store, cx| store.pushed(&root, cx));
+                    }
                     if single {
                         if let Some(message) = problem(&outcome) {
                             this.show_message(&title, format!("{name}: {message}"), window, cx);
