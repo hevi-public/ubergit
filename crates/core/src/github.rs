@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
@@ -126,8 +127,12 @@ pub struct PrLookup {
 /// take up the five places.
 const PR_SEARCH: &str = "first: 5, states: [OPEN, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}";
 
-const FRAGMENTS: &str = "\
-fragment Repo on Repository { nameWithOwner defaultBranchRef { name } }
+const REPO_FRAGMENT: &str = "fragment Repo on Repository { nameWithOwner defaultBranchRef { name } }\n";
+
+/// Everything shown about one PR. The overview's detail asks for it alone (see
+/// [`pr_detail`]), so it's kept apart from [`REPO_FRAGMENT`]: GitHub rejects a query that
+/// defines a fragment it doesn't use.
+const PR_FRAGMENT: &str = "\
 fragment Pr on PullRequest {
   number title url state isDraft updatedAt reviewDecision headRefOid baseRefName
   headRepository { nameWithOwner } baseRepository { nameWithOwner }
@@ -170,7 +175,7 @@ pub fn build_query(targets: &[PrTarget]) -> Value {
         variables.insert(format!("b{i}"), target.branch.clone().into());
         variables.insert(format!("q{i}"), format!("refs/heads/{}", target.branch).into());
     }
-    let query = format!("query({}) {{\n{selection}}}\n{FRAGMENTS}", declarations.join(", "));
+    let query = format!("query({}) {{\n{selection}}}\n{REPO_FRAGMENT}{PR_FRAGMENT}", declarations.join(", "));
     json!({ "query": query, "variables": variables })
 }
 
@@ -274,36 +279,72 @@ struct GraphqlError {
     path: Option<Vec<Value>>,
 }
 
+/// `gh api graphql`'s answer, read. Only a body without `data` fails as a whole; each
+/// top-level field is then taken with [`Answer::take`], which fails just that one.
+pub(crate) struct Answer {
+    data: serde_json::Map<String, Value>,
+    errors: Vec<GraphqlError>,
+}
+
+impl Answer {
+    pub(crate) fn parse(stdout: &[u8]) -> Result<Self, String> {
+        let response: Response =
+            serde_json::from_slice(stdout).map_err(|err| format!("unexpected answer from GitHub: {err}"))?;
+        let errors = response.errors.unwrap_or_default();
+        match response.data {
+            Some(data) => Ok(Self { data, errors }),
+            None => Err(errors
+                .first()
+                .map_or_else(|| "GitHub's answer has no data".into(), |e| e.message.clone())),
+        }
+    }
+
+    /// The field at `alias`, or why GitHub gave none. GitHub nulls a field that failed and
+    /// keeps the rest, so an error anywhere inside it fails it too: it would otherwise read
+    /// as, say, no PRs.
+    pub(crate) fn take<T: DeserializeOwned>(&mut self, alias: &str) -> Result<T, String> {
+        let error = self
+            .errors
+            .iter()
+            .find(|e| e.path.as_ref().and_then(|p| p.first()).and_then(Value::as_str) == Some(alias));
+        if let Some(error) = error {
+            return Err(error.message.clone());
+        }
+        match self.data.remove(alias) {
+            None | Some(Value::Null) => Err("no answer from GitHub".into()),
+            Some(value) => serde_json::from_value(value).map_err(|err| format!("unexpected answer from GitHub: {err}")),
+        }
+    }
+}
+
+/// Why a query got no answer.
+pub(crate) enum Failed {
+    /// gh is missing or not logged in: every other call would fail the same way.
+    Gh(GhError),
+    /// This call failed, say it timed out; others may still work.
+    Call(String),
+}
+
+/// Runs one query on `host`. `gh api graphql` exits 1 when part of a query failed, but
+/// still prints the rest, so that counts as an answer.
+pub(crate) async fn ask(gh: &Gh, host: &str, body: &Value, cwd: &Path) -> Result<Answer, Failed> {
+    let cmd = GhCommand::new(["api", "graphql", "--hostname", host, "--input", "-"])
+        .cwd(cwd)
+        .stdin(body.to_string());
+    match gh.run(cmd).await {
+        Ok(out) => Answer::parse(&out.stdout).map_err(Failed::Call),
+        Err(err @ (GhError::NotInstalled | GhError::NotLoggedIn { .. })) => Err(Failed::Gh(err)),
+        Err(err) => match &err {
+            GhError::Failed { stdout, .. } => Answer::parse(stdout).map_err(|_| Failed::Call(err.to_string())),
+            _ => Err(Failed::Call(err.to_string())),
+        },
+    }
+}
+
 /// The repo behind each alias `r0`..`r{count-1}`, or why GitHub gave none.
 fn parse_repos(stdout: &[u8], count: usize) -> Result<Vec<Result<RepoNode, String>>, String> {
-    let response: Response =
-        serde_json::from_slice(stdout).map_err(|err| format!("unexpected answer from GitHub: {err}"))?;
-    let errors = response.errors.unwrap_or_default();
-    let Some(mut data) = response.data else {
-        return Err(errors
-            .first()
-            .map_or_else(|| "GitHub's answer has no data".into(), |e| e.message.clone()));
-    };
-    let error_at = |alias: &str| {
-        errors
-            .iter()
-            .find(|e| e.path.as_ref().and_then(|p| p.first()).and_then(Value::as_str) == Some(alias))
-            .map(|e| e.message.clone())
-    };
-    Ok((0..count)
-        .map(|i| {
-            let alias = format!("r{i}");
-            // GitHub nulls a field that failed and leaves the repo, so an error anywhere in
-            // it would otherwise read as no PR.
-            if let Some(message) = error_at(&alias) {
-                return Err(message);
-            }
-            match data.remove(&alias) {
-                None | Some(Value::Null) => Err("no answer from GitHub".into()),
-                Some(repo) => serde_json::from_value(repo).map_err(|err| format!("unexpected answer from GitHub: {err}")),
-            }
-        })
-        .collect())
+    let mut answer = Answer::parse(stdout)?;
+    Ok((0..count).map(|i| answer.take(&format!("r{i}"))).collect())
 }
 
 fn resolve(repo: &RepoNode, target: &PrTarget) -> PrLookup {
@@ -346,8 +387,11 @@ fn pick_pr(repo: &RepoNode, local_oid: Option<&str>) -> Option<PullRequest> {
             .iter()
             .find(|(pr, _)| pr.state == "MERGED" && local_oid == Some(pr.head_ref_oid.as_str()))
     })?;
+    Some(pull_request(pr, base_repo))
+}
 
-    Some(PullRequest {
+fn pull_request(pr: &PrNode, base_repo: &str) -> PullRequest {
+    PullRequest {
         number: pr.number,
         title: pr.title.clone(),
         url: pr.url.clone(),
@@ -356,12 +400,7 @@ fn pick_pr(repo: &RepoNode, local_oid: Option<&str>) -> Option<PullRequest> {
             (_, true) => PrState::Draft,
             _ => PrState::Open,
         },
-        review: match pr.review_decision.as_deref() {
-            Some("APPROVED") => Some(ReviewDecision::Approved),
-            Some("CHANGES_REQUESTED") => Some(ReviewDecision::ChangesRequested),
-            Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
-            _ => None,
-        },
+        review: review_decision(pr.review_decision.as_deref()),
         checks: pr
             .commits
             .nodes
@@ -372,20 +411,78 @@ fn pick_pr(repo: &RepoNode, local_oid: Option<&str>) -> Option<PullRequest> {
         base_ref: pr.base_ref_name.clone(),
         base_repo: base_repo.to_string(),
         head_oid: pr.head_ref_oid.clone(),
-    })
+    }
+}
+
+/// The body asking for one PR in full: its reviews, and the names of its checks. The
+/// overview's lists only have each PR's checks rollup, so this is asked for the PR
+/// selected there, never for every PR.
+pub fn build_detail_query(repo: &str, number: u64) -> Value {
+    let (owner, name) = repo.split_once('/').unwrap_or((repo, ""));
+    let query = format!(
+        "query($o: String!, $n: String!, $p: Int!) {{\n  \
+         r0: repository(owner: $o, name: $n) {{ pullRequest(number: $p) {{ ...Pr }} }}\n}}\n{PR_FRAGMENT}"
+    );
+    json!({ "query": query, "variables": { "o": owner, "n": name, "p": number } })
+}
+
+/// Reads `gh api graphql`'s answer to [`build_detail_query`] for `repo` (`owner/name`).
+pub fn parse_detail(stdout: &[u8], repo: &str) -> Result<PullRequest, String> {
+    detail_from(Answer::parse(stdout)?, repo)
+}
+
+fn detail_from(mut answer: Answer, repo: &str) -> Result<PullRequest, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repo {
+        pull_request: Option<PrNode>,
+    }
+    let pr = answer.take::<Repo>("r0")?.pull_request.ok_or("no such pull request")?;
+    let base = pr.base_repository.as_ref().map_or(repo, |base| base.name_with_owner.as_str());
+    Ok(pull_request(&pr, base))
+}
+
+/// Looks up one PR in full, as [`build_detail_query`] asks. `host` must come from
+/// [`logged_in_hosts`]. Only gh missing or logged out is a [`GhError`].
+pub async fn pr_detail(
+    gh: &Gh,
+    host: &str,
+    repo: &str,
+    number: u64,
+    cwd: &Path,
+) -> Result<Result<PullRequest, String>, GhError> {
+    match ask(gh, host, &build_detail_query(repo, number), cwd).await {
+        Ok(answer) => Ok(detail_from(answer, repo)),
+        Err(Failed::Gh(err)) => Err(err),
+        Err(Failed::Call(message)) => Ok(Err(message)),
+    }
 }
 
 /// Check-run conclusions that count as failed; the others are success, neutral, skipped
 /// and stale.
 const FAILED_CONCLUSIONS: [&str; 5] = ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"];
 
+pub(crate) fn review_decision(decision: Option<&str>) -> Option<ReviewDecision> {
+    match decision? {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
+}
+
+/// A commit's checks rollup state, as a whole.
+pub(crate) fn checks_state(state: &str) -> Option<ChecksState> {
+    match state {
+        "SUCCESS" => Some(ChecksState::Passing),
+        "FAILURE" | "ERROR" => Some(ChecksState::Failing),
+        "PENDING" | "EXPECTED" => Some(ChecksState::Pending),
+        _ => None,
+    }
+}
+
 fn checks(rollup: &Rollup) -> Option<Checks> {
-    let state = match rollup.state.as_str() {
-        "SUCCESS" => ChecksState::Passing,
-        "FAILURE" | "ERROR" => ChecksState::Failing,
-        "PENDING" | "EXPECTED" => ChecksState::Pending,
-        _ => return None,
-    };
+    let state = checks_state(&rollup.state)?;
     let mut failing: Vec<String> = Vec::new();
     let mut pending = 0;
     for context in &rollup.contexts.nodes {
@@ -526,9 +623,9 @@ fn parse_auth_hosts(stdout: &[u8]) -> Option<Vec<String>> {
 
 /// A GraphQL connection. GitHub makes the connection, its `nodes` and each node nullable
 /// (a node the login can't see comes back null), so nulls read as absent.
-struct Connection<T> {
-    nodes: Vec<T>,
-    total_count: u32,
+pub(crate) struct Connection<T> {
+    pub(crate) nodes: Vec<T>,
+    pub(crate) total_count: u32,
 }
 
 impl<T> Default for Connection<T> {
@@ -616,13 +713,13 @@ struct PrNode {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RepoName {
-    name_with_owner: String,
+pub(crate) struct RepoName {
+    pub(crate) name_with_owner: String,
 }
 
 #[derive(Deserialize)]
-struct Login {
-    login: String,
+pub(crate) struct Login {
+    pub(crate) login: String,
 }
 
 #[derive(Deserialize)]

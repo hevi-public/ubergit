@@ -7,6 +7,7 @@ pub mod gh;
 pub mod git;
 pub mod github;
 pub mod model;
+pub mod open_prs;
 pub mod ops;
 pub mod patch;
 pub mod pr_status;
