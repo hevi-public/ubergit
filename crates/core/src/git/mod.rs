@@ -5,13 +5,11 @@ pub mod parse;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use futures_lite::{AsyncWriteExt as _, future};
+use crate::process::{self, RunError, first_line};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmdKind {
@@ -71,19 +69,7 @@ impl GitCommand {
     }
 
     fn display_args(&self) -> String {
-        let mut out = String::from("git");
-        for arg in &self.args {
-            let arg = arg.to_string_lossy();
-            out.push(' ');
-            if arg.is_empty() || arg.contains(|c: char| c.is_whitespace() || c == '\'') {
-                out.push('\'');
-                out.push_str(&arg.replace('\'', "'\\''"));
-                out.push('\'');
-            } else {
-                out.push_str(&arg);
-            }
-        }
-        out
+        process::display_command("git", &self.args)
     }
 }
 
@@ -125,10 +111,6 @@ impl GitError {
             other => other.to_string(),
         }
     }
-}
-
-fn first_line(text: &str) -> Option<&str> {
-    text.lines().map(str::trim).find(|l| !l.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -269,47 +251,17 @@ impl Git {
         for (key, value) in self.extra_env.iter() {
             std_cmd.env(key, value);
         }
-        // New session: no controlling TTY, so ssh/credential helpers can't block on a
-        // prompt, and the whole process group can be killed on timeout.
-        // SAFETY: setsid is async-signal-safe and touches no Rust state.
-        unsafe {
-            std_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
 
-        let mut command: async_process::Command = std_cmd.into();
-        command
-            .stdin(if cmd.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn()?;
-        let pid = child.id() as libc::pid_t;
-
-        if let (Some(input), Some(mut stdin)) = (&cmd.stdin, child.stdin.take()) {
-            stdin.write_all(input).await?;
-            stdin.close().await?;
-        }
-
-        let output = future::or(async { Some(child.output().await) }, async {
-            async_io::Timer::after(cmd.timeout).await;
-            None
-        })
-        .await;
-
-        let Some(output) = output else {
-            // SAFETY: plain syscall; the child is its own process-group leader (setsid).
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
+        let output = match process::run_bounded(std_cmd, cmd.stdin.as_deref(), cmd.timeout).await {
+            Ok(output) => output,
+            Err(RunError::Spawn(err) | RunError::Io(err)) => return Err(GitError::Spawn(err)),
+            Err(RunError::TimedOut) => {
+                return Err(GitError::Timeout {
+                    command: cmd.display_args(),
+                    timeout: cmd.timeout,
+                });
             }
-            return Err(GitError::Timeout {
-                command: cmd.display_args(),
-                timeout: cmd.timeout,
-            });
         };
-        let output = output?;
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let ok_code = output.status.code().is_some_and(|c| cmd.ok_codes.contains(&c));
         if output.status.success() || ok_code {
