@@ -37,6 +37,42 @@ const MIN_BRANCH: usize = 10;
 struct RepoColumns {
     name: usize,
     branch: usize,
+    /// Some repo has worktrees, so names make room for the tree's markers.
+    tree: bool,
+}
+
+/// Before a name while some repo has worktrees: a group's `▸` (collapsed) or `▾`, a
+/// worktree's indented `└`, or blanks to line the others up.
+fn tree_marker(store: &RepoStore, ix: usize, open: bool) -> &'static str {
+    if store.repos[ix].main_repo.is_some() {
+        "  └ "
+    } else if store.worktrees_of(ix).is_empty() {
+        "  "
+    } else if open {
+        "▾ "
+    } else {
+        "▸ "
+    }
+}
+
+/// Whether the group at `visible[pos]` is open: some of its worktrees are listed after it.
+fn group_open(store: &RepoStore, visible: &[usize], pos: usize) -> bool {
+    let (Some(&ix), Some(next)) = (visible.get(pos), visible.get(pos + 1)) else {
+        return false;
+    };
+    store.worktrees_of(ix).contains(next)
+}
+
+/// ` +5 wt · 2 PR` after a collapsed group's main checkout: the worktrees it hides, and
+/// how many of those have an open PR.
+fn group_summary(store: &RepoStore, ix: usize) -> Line {
+    let worktrees = store.worktrees_of(ix);
+    let mut line = Line::new();
+    line.color(format!(" +{} wt", worktrees.len()), Palette::dim());
+    if let Some(prs) = pr::group_badge(store.repos[worktrees].iter().map(|e| store.pr_view(e))) {
+        line.append(prs);
+    }
+    line
 }
 
 /// Resize handles are invisible until hovered or dragged, then show as a thin line in
@@ -159,7 +195,15 @@ impl Workspace {
             title.color(format!(" (filter: {filter})"), Palette::cyan());
         }
         if panel == Panel::Repos && !self.marked.is_empty() {
-            title.color(format!(" ({} marked)", self.marked.len()), Palette::cyan());
+            // Marks the filter or a collapsed group hides aren't acted on.
+            let listed = self.listed_marked(cx).len();
+            let hidden = self.marked.len() - listed;
+            let text = if hidden > 0 {
+                format!(" ({listed} marked, {hidden} hidden)")
+            } else {
+                format!(" ({listed} marked)")
+            };
+            title.color(text, Palette::cyan());
         }
         self.frame(title, active, footer, body)
     }
@@ -218,11 +262,35 @@ impl Workspace {
                 range
                     .filter_map(|pos| {
                         let ix = *visible.get(pos)?;
-                        let line = this.row(view, ix, store, columns);
+                        let line = if view == View::Repos {
+                            this.repo_row(store, &visible, pos, columns)
+                        } else {
+                            this.row(view, ix, store)
+                        };
                         let selected = pos == cursor;
+                        // A group's `▸`/`▾`, after the mark column and the glyph.
+                        let marker = (view == View::Repos && columns.tree && !store.worktrees_of(ix).is_empty())
+                            .then(|| {
+                                let before = if this.marked.is_empty() { 2. } else { 4. };
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .h(LINE_HEIGHT)
+                                    .left(px(4.) + CHAR_WIDTH * before)
+                                    .w(CHAR_WIDTH * 2.)
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_group_at(pos, window, cx);
+                                        }),
+                                    )
+                            });
                         Some(
                             div()
                                 .id(pos)
+                                .relative()
                                 .h(LINE_HEIGHT)
                                 .px(px(4.))
                                 .overflow_hidden()
@@ -231,6 +299,7 @@ impl Workspace {
                                     d.bg(if active { Palette::selection() } else { Palette::inactive_selection() })
                                 })
                                 .child(line.build())
+                                .children(marker)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -276,7 +345,15 @@ impl Workspace {
             })
             .collect();
         let widest = |branch_width: usize| tails.iter().map(|&(b, after)| b.min(branch_width) + after).max().unwrap_or(0);
-        let longest = rows.iter().map(|&ix| store.repos[ix].name().chars().count()).max().unwrap_or(0);
+        let tree = store.repos.iter().any(|r| r.main_repo.is_some());
+        let longest = rows
+            .iter()
+            .map(|&ix| {
+                let marker = if tree { tree_marker(store, ix, false).chars().count() } else { 0 };
+                marker + store.repos[ix].short_name().chars().count()
+            })
+            .max()
+            .unwrap_or(0);
         let branch = (MIN_BRANCH..=MAX_BRANCH)
             .rev()
             .find(|&w| longest + widest(w) <= room)
@@ -284,14 +361,11 @@ impl Workspace {
         RepoColumns {
             name: longest.min(room.saturating_sub(widest(branch)).max(10)),
             branch,
+            tree,
         }
     }
 
-    fn row(&self, view: View, ix: usize, store: &RepoStore, columns: RepoColumns) -> Line {
-        if view == View::Repos {
-            let entry = &store.repos[ix];
-            return self.repo_row(entry, store.pr_view(entry), columns);
-        }
+    fn row(&self, view: View, ix: usize, store: &RepoStore) -> Line {
         let Some(d) = store.selected_detail() else { return Line::new() };
         let mut line = Line::new();
         match view {
@@ -389,7 +463,20 @@ impl Workspace {
         line
     }
 
-    fn repo_row(&self, entry: &RepoEntry, pr: PrView, columns: RepoColumns) -> Line {
+    /// The Repos panel's row for `visible[pos]`. A collapsed group's main checkout ends with
+    /// what its worktrees hold.
+    fn repo_row(&self, store: &RepoStore, visible: &[usize], pos: usize, columns: RepoColumns) -> Line {
+        let ix = visible[pos];
+        let entry = &store.repos[ix];
+        let open = group_open(store, visible, pos);
+        let mut line = self.repo_line(entry, store.pr_view(entry), columns, tree_marker(store, ix, open));
+        if !open && !store.worktrees_of(ix).is_empty() {
+            line.append(group_summary(store, ix));
+        }
+        line
+    }
+
+    fn repo_line(&self, entry: &RepoEntry, pr: PrView, columns: RepoColumns, marker: &str) -> Line {
         let name_width = columns.name;
         let mut line = Line::new();
         let mut name_end = name_width + 3;
@@ -408,7 +495,9 @@ impl Workspace {
         };
         line.color(glyph, color);
         line.push(" ");
-        line.push(truncate(entry.name(), name_width));
+        let marker = if columns.tree { marker } else { "" };
+        line.color(marker, Palette::dim());
+        line.push(truncate(&entry.short_name(), name_width.saturating_sub(marker.chars().count())));
         line.pad_to(name_end);
         let Some(s) = &entry.summary else {
             if let Some(err) = &entry.error {
@@ -584,12 +673,12 @@ impl Workspace {
     fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
         let visible = self.visible(View::Repos, store);
-        let name_w = visible
-            .iter()
-            .map(|&ix| store.repos[ix].name().chars().count())
+        let tree = store.repos.iter().any(|r| r.main_repo.is_some());
+        let name_w = (0..visible.len())
+            .map(|pos| overview_name(store, &visible, pos, tree, None).width())
             .max()
             .unwrap_or(4)
-            .clamp(4, 32);
+            .clamp(4, 40);
         let count = visible.len() + 1;
         uniform_list(
             "overview",
@@ -613,7 +702,8 @@ impl Workspace {
                             if marks {
                                 mark_column(&mut line, this.marked.contains(&entry.location.root));
                             }
-                            line.append(overview_row(entry, name_w, prs.then(|| store.pr_view(entry))));
+                            let name = overview_name(store, &visible, pos - 1, tree, Some(name_w));
+                            line.append(overview_row(entry, name, prs.then(|| store.pr_view(entry))));
                         }
                         div()
                             .id(pos)
@@ -780,7 +870,13 @@ impl Workspace {
             .rev()
             .map(|record| {
                 let mut line = Line::new();
-                match store.repos.iter().find(|r| record.cwd.starts_with(&r.location.root)) {
+                // The deepest repo: a worktree can be inside its main checkout.
+                let repo = store
+                    .repos
+                    .iter()
+                    .filter(|r| record.cwd.starts_with(&r.location.root))
+                    .max_by_key(|r| r.location.root.as_os_str().len());
+                match repo {
                     Some(repo) => {
                         line.color(format!("{}: ", repo.name()), Palette::cyan());
                     }
@@ -1246,6 +1342,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::checkout_by_name))
             .on_action(cx.listener(Self::new_branch_in_repos))
             .on_action(cx.listener(Self::switch_to_default))
+            .on_action(cx.listener(Self::toggle_worktrees))
+            .on_action(cx.listener(Self::toggle_all_worktrees))
             .on_action(cx.listener(Self::toggle_stage))
             .on_action(cx.listener(Self::toggle_stage_all))
             .on_action(cx.listener(Self::commit))
@@ -1392,8 +1490,30 @@ fn overview_header(name_w: usize, prs: bool) -> Line {
     line
 }
 
-/// One repo's overview line, with a PR cell when given what to show for its PR.
-fn overview_row(entry: &RepoEntry, name_w: usize, pr: Option<PrView>) -> Line {
+/// The overview's name cell for `visible[pos]`, `width` wide (`None`: as wide as it needs):
+/// like the Repos panel's name, with a collapsed group's summary in it, where the row's
+/// end would be out of sight.
+fn overview_name(store: &RepoStore, visible: &[usize], pos: usize, tree: bool, width: Option<usize>) -> Line {
+    let ix = visible[pos];
+    let open = group_open(store, visible, pos);
+    let marker = if tree { tree_marker(store, ix, open) } else { "" };
+    let summary = (!open && !store.worktrees_of(ix).is_empty()).then(|| group_summary(store, ix));
+    let room = width.map_or(usize::MAX, |width| {
+        width.saturating_sub(marker.chars().count() + summary.as_ref().map_or(0, Line::width))
+    });
+    let mut line = Line::new();
+    line.color(marker, Palette::dim());
+    line.push(truncate(&store.repos[ix].short_name(), room));
+    if let Some(summary) = summary {
+        line.append(summary);
+    }
+    line.pad_to(width.unwrap_or(0));
+    line
+}
+
+/// One repo's overview line, after `name`, its name cell, with a PR cell when given what
+/// to show for its PR.
+fn overview_row(entry: &RepoEntry, name: Line, pr: Option<PrView>) -> Line {
     let mut line = Line::new();
     let (glyph, color) = match &entry.summary {
         _ if entry.error.is_some() => ("⚠", Palette::red()),
@@ -1402,7 +1522,8 @@ fn overview_row(entry: &RepoEntry, name_w: usize, pr: Option<PrView>) -> Line {
     };
     line.color(glyph, color);
     line.push(" ");
-    line.push(format!("{:<name_w$}  ", truncate(entry.name(), name_w)));
+    line.append(name);
+    line.push("  ");
     let Some(s) = &entry.summary else {
         if let Some(err) = &entry.error {
             line.color(truncate(err.lines().next().unwrap_or(""), 80), Palette::red());

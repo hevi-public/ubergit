@@ -34,21 +34,31 @@ pub struct BatchRow {
 impl Workspace {
     // ---- marks ------------------------------------------------------------------------------
 
-    /// Marked repos in Repos-panel order, when the action starts from the Repos panel.
+    /// Marked repos in Repos-panel order, when the action starts from the Repos panel. Only
+    /// listed ones count: a mark hidden by the filter or a collapsed group isn't acted on.
     pub(crate) fn marked_targets(&self, cx: &App) -> Option<Vec<PathBuf>> {
-        if self.focused != Panel::Repos || self.marked.is_empty() {
+        if self.focused != Panel::Repos {
             return None;
         }
+        let marked = self.listed_marked(cx);
+        (!marked.is_empty()).then_some(marked)
+    }
+
+    /// Marked repos that are listed, in Repos-panel order.
+    pub(crate) fn listed_marked(&self, cx: &App) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            return Vec::new();
+        }
+        self.listed_roots(cx).into_iter().filter(|root| self.marked.contains(root)).collect()
+    }
+
+    /// Every listed repo, in Repos-panel order.
+    pub(crate) fn listed_roots(&self, cx: &App) -> Vec<PathBuf> {
         let store = self.store.read(cx);
-        Some(
-            store
-                .repos
-                .iter()
-                .map(|r| &r.location.root)
-                .filter(|root| self.marked.contains(*root))
-                .cloned()
-                .collect(),
-        )
+        self.visible(View::Repos, store)
+            .into_iter()
+            .map(|ix| store.repos[ix].location.root.clone())
+            .collect()
     }
 
     /// Marked repos, else the selected one.
@@ -76,12 +86,7 @@ impl Workspace {
 
     /// Marks every listed (filtered) repo, or unmarks them if all are marked already.
     pub fn toggle_mark_all(&mut self, _: &ToggleMarkAll, _: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let listed: Vec<PathBuf> = self
-            .visible(View::Repos, store)
-            .into_iter()
-            .map(|ix| store.repos[ix].location.root.clone())
-            .collect();
+        let listed = self.listed_roots(cx);
         if listed.iter().all(|root| self.marked.contains(root)) {
             for root in &listed {
                 self.marked.remove(root);
@@ -300,11 +305,11 @@ impl Workspace {
         }
         let marked = self.marked_targets(cx);
         let roots = marked.clone().unwrap_or_else(|| {
-            store
-                .repos
-                .iter()
-                .filter(|r| precheck(r).is_ok_and(|s| fast_forward_check(s).is_none()))
-                .map(|r| r.location.root.clone())
+            self.listed_roots(cx)
+                .into_iter()
+                .filter(|root| {
+                    store.entry(root).is_some_and(|r| precheck(r).is_ok_and(|s| fast_forward_check(s).is_none()))
+                })
                 .collect()
         });
         if roots.is_empty() {

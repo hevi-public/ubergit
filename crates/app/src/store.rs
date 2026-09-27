@@ -2,8 +2,9 @@
 //! log, and the background work that keeps them fresh (watcher, poller, auto-fetch,
 //! PR lookups).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -29,6 +30,9 @@ pub struct RepoEntry {
     /// The checked-out branch's pull request. Show it through [`RepoStore::pr_view`],
     /// which hides an answer for another branch.
     pub pr: RepoPr,
+    /// For a linked worktree whose main checkout is listed, that checkout's root. The
+    /// worktree is listed right after it, and hides when its group is collapsed.
+    pub main_repo: Option<PathBuf>,
     refreshing: bool,
     refresh_again: bool,
 }
@@ -42,6 +46,7 @@ impl RepoEntry {
             fetch_error: None,
             busy: None,
             pr: RepoPr::default(),
+            main_repo: None,
             refreshing: false,
             refresh_again: false,
         }
@@ -49,6 +54,15 @@ impl RepoEntry {
 
     pub fn name(&self) -> &str {
         &self.location.name
+    }
+
+    /// What the Repos panel and the overview call it: a grouped worktree goes by its
+    /// directory's name, as its main checkout's name is right above it.
+    pub fn short_name(&self) -> String {
+        match (&self.main_repo, self.location.root.file_name()) {
+            (Some(_), Some(dir)) => dir.to_string_lossy().into_owned(),
+            _ => self.location.name.clone(),
+        }
     }
 }
 
@@ -206,6 +220,17 @@ impl RepoStore {
         self.index_of(root).map(|ix| &self.repos[ix])
     }
 
+    /// Indices of the repo's grouped worktrees, which follow it in `repos`. Empty unless
+    /// it's a main checkout that has some.
+    pub fn worktrees_of(&self, ix: usize) -> Range<usize> {
+        let root = &self.repos[ix].location.root;
+        let count = self.repos[ix + 1..]
+            .iter()
+            .take_while(|r| r.main_repo.as_ref() == Some(root))
+            .count();
+        ix + 1..ix + 1 + count
+    }
+
     pub fn selected_entry(&self) -> Option<&RepoEntry> {
         self.selected.as_deref().and_then(|root| self.entry(root))
     }
@@ -272,7 +297,21 @@ impl RepoStore {
             entry.error = resolved.err().map(|e| format!("{e:#}"));
             self.repos.push(entry);
         }
-        self.repos.sort_by(|a, b| a.location.name.cmp(&b.location.name));
+        let locations: Vec<&RepoLocation> = self.repos.iter().map(|r| &r.location).collect();
+        let mains: Vec<Option<PathBuf>> = discovery::main_checkouts(&locations)
+            .into_iter()
+            .map(|main| main.map(|ix| locations[ix].root.clone()))
+            .collect();
+        for (entry, main) in self.repos.iter_mut().zip(mains) {
+            entry.main_repo = main;
+        }
+        // By name, with each main checkout's worktrees right after it.
+        let names: HashMap<PathBuf, String> =
+            self.repos.iter().map(|r| (r.location.root.clone(), r.location.name.clone())).collect();
+        self.repos.sort_by_cached_key(|r| {
+            let group = r.main_repo.as_ref().map_or(&r.location.name, |main| &names[main]).clone();
+            (group, r.main_repo.is_some(), r.location.name.clone())
+        });
 
         let locations: Vec<RepoLocation> = self
             .repos

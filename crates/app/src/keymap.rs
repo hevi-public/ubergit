@@ -60,6 +60,8 @@ actions!(
         CheckoutByName,
         NewBranchInRepos,
         SwitchToDefault,
+        ToggleWorktrees,
+        ToggleAllWorktrees,
         // files
         ToggleStage,
         ToggleStageAll,
@@ -175,9 +177,11 @@ keymap! {
     "f", "Repos" => Fetch, "Fetch";
     "p", "Repos" => Pull, "Pull";
     "shift-p", "Repos" => Push, "Push";
-    "shift-f", "Repos" => FetchAll, "Fetch all repositories";
-    "shift-u", "Repos" => FastForwardAll, "Fast-forward clean repos that are behind (marked, else all)";
+    "shift-f", "Repos" => FetchAll, "Fetch the marked repositories, else all listed ones";
+    "shift-u", "Repos" => FastForwardAll, "Fast-forward clean repos that are behind (marked, else all listed)";
     "o", "Repos" => OpenInLazygit, "Open in lazygit";
+    "z", "Repos" => ToggleWorktrees, "Show / hide the repo's worktrees (on a worktree: hide them)";
+    "shift-z", "Repos" => ToggleAllWorktrees, "Show / hide every repo's worktrees";
 
     // Files
     "space", "Files" => ToggleStage, "Stage / unstage";

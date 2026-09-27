@@ -23,7 +23,7 @@ Status, and the main view against the command log.
 
 The layout survives restarts. Panel sizes, the window's size, position and display, the
 screen mode, whether the command log shows, the focused panel, each panel's tab, and each
-workdir's selected repo are saved on quit and every 30 s to
+workdir's selected repo and open worktree groups are saved on quit and every 30 s to
 `~/Library/Application Support/ubergit/state.json`. Delete the file to reset them. If the saved
 display is gone or the window would be off-screen, the window opens centred instead.
 
@@ -38,9 +38,10 @@ Options: `--no-fetch` disables background fetching.
 
 ## How it stays live
 
-- **File watching**: one recursive FSEvents watch on the workdir. Events are routed to
-  their repo and coalesced (250 ms quiet, 2 s max). Changes under `node_modules`, `target`
-  and other gitignored paths are dropped.
+- **File watching**: one recursive FSEvents watch on the workdir, plus one for each worktree
+  or git dir outside it. Events are routed to their repo and coalesced (250 ms quiet, 2 s
+  max). Changes under `node_modules`, `target` and other gitignored paths are dropped.
+  Adding or removing a worktree rescans.
 - **Auto-fetch**: every 5 minutes, at most 4 repos at a time. It never prompts: the terminal
   prompt is off and ssh runs with `BatchMode`. Failures show as `fetch failed` on the repo.
 - **Safety-net poll**: every repo's status is recomputed every 60 s.
@@ -68,7 +69,7 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 | Where | Keys |
 |---|---|
 | Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `G` open the branch's pull request in the browser (or GitHub's page to open one) · `R` rescan, re-check gh and refresh PR status (no fetch) · `@` toggle command log |
-| Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch all · `U` fast-forward repos that are behind · `o` open in lazygit |
+| Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch the listed repos · `U` fast-forward repos that are behind · `z` show/hide the repo's worktrees · `Z` show/hide all worktrees · `o` open in lazygit |
 | Files | `space` stage/unstage · `enter` stage lines · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
 | Staging (`enter` on a file) | `space` stage/unstage the selection · `d` discard it (in staged changes: unstage it) · `a` hunk or line selection · `v` range · `shift-↑`/`shift-↓` extend the range · `h`/`l` or `←`/`→` previous/next hunk · `tab` other half · `c` commit · `esc` back |
 | Branches | `space` checkout · `n` new · `d` delete · `f` fast-forward · `-` previous branch · `u` set upstream |
@@ -87,11 +88,25 @@ Untracked, new, deleted and renamed files work too: staging part of a new file a
 lines, and unstaging lines of a rename keeps the rename. Binary files, submodules and files with
 conflicts have no lines to pick; stage them whole from Files.
 
+## Worktrees
+
+Linked worktrees are listed under their main checkout, wherever they are: in hidden
+directories such as Claude Code's `.claude/worktrees/`, or outside the workdir. Each is its own
+row, with its branch, upstream, changes and PR, named by its directory; the Status view has
+its path. Groups start collapsed: `▸ speech main ✓ +5 wt · 2 PR` counts the worktrees and
+their open PRs, red when some PR's checks fail and yellow while some are running. `z` (or a
+click on `▸`) shows them, `z` on a worktree hides its group again, and `Z` shows or hides
+every group. The overview groups them the same way. A filter lists the worktrees it matches,
+collapsed or not, with their main checkout.
+
+Status, PR lookups and auto-fetch keep covering hidden worktrees; only actions skip them.
+
 ## Working across repos
 
 Mark repos in the Repos panel with `space` (or cmd-click), or mark every listed repo with `a`.
 The count shows in the panel title, and `esc` clears the marks. Actions started from the Repos
 panel then run on every marked repo at once. With nothing marked, they run on the selected repo.
+Only listed repos count: a mark the filter or a collapsed group hides isn't acted on.
 
 - `c` checks out a branch by name. It uses the local branch, or creates one tracking
   `origin/<name>`.
@@ -100,7 +115,8 @@ panel then run on every marked repo at once. With nothing marked, they run on th
   quickest way back to a clean `main` everywhere.
 - `f` / `p` / `P` fetch, pull or push each marked repo. Push asks first, and it never
   force-pushes more than one repo: to force-push, press `P` on that repo alone.
-- `U` fast-forwards the marked repos, or, with nothing marked, every repo that can be.
+- `U` fast-forwards the marked repos, or, with nothing marked, every listed repo that can be.
+- `F` fetches the marked repos, or, with nothing marked, every listed one.
 
 Nothing is half-done. Repos that are busy, bare, mid-rebase or mid-merge are skipped with a
 reason, and so are repos with uncommitted changes for `c`, `m` and `U`. The others run in
