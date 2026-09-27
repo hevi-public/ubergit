@@ -67,7 +67,7 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 
 | Where | Keys |
 |---|---|
-| Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `R` rescan, re-check gh and refresh PR status (no fetch) · `@` toggle command log |
+| Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `G` open the branch's pull request in the browser (or GitHub's page to open one) · `R` rescan, re-check gh and refresh PR status (no fetch) · `@` toggle command log |
 | Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch all · `U` fast-forward repos that are behind · `o` open in lazygit |
 | Files | `space` stage/unstage · `enter` stage lines · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
 | Staging (`enter` on a file) | `space` stage/unstage the selection · `d` discard it (in staged changes: unstage it) · `a` hunk or line selection · `v` range · `shift-↑`/`shift-↓` extend the range · `h`/`l` or `←`/`→` previous/next hunk · `tab` other half · `c` commit · `esc` back |
@@ -119,6 +119,13 @@ hosts (`gh auth login --hostname …`). A branch pushed to a fork finds its PR o
 - The Repos panel: `#412✓` after the branch, coloured like the overview's word.
 - The Status view (`1`): the title and base branch, who approved, requested changes or was asked
   to review, which checks failed, and when it was last looked up.
+
+`G`, from any panel, opens the selected repo's pull request in the browser. Without one, it opens
+GitHub's page for opening one once the branch is pushed: the Status view then says
+`none  (G opens one)`. For a branch in a fork, that page proposes it to the parent repository,
+against its default branch, as GitHub itself does. It never pushes; `P` does that. Otherwise it
+says why there's nothing to open, or looks the PR up if it isn't known yet. It acts on the
+selected repo only, even with repos marked.
 
 Without gh, or while it isn't logged in, the `PR` column is hidden and the Status view says why.
 `github_status = false` turns PR status off.

@@ -53,6 +53,7 @@ actions!(
         Push,
         FastForwardAll,
         OpenInLazygit,
+        OpenPullRequest,
         // repos: marks and multi-repo actions
         ToggleMark,
         ToggleMarkAll,
@@ -162,6 +163,8 @@ keymap! {
     "f", "Panels" => Fetch, "Fetch";
     "p", "Panels" => Pull, "Pull";
     "shift-p", "Panels" => Push, "Push";
+    // The selected repo even with repos marked: a browser tab for each would be a surprise.
+    "shift-g", "Panels" => OpenPullRequest, "Open the branch's pull request (or GitHub's page to open one)";
 
     // Repos. With repos marked, these run on every marked repo, else on the selected one.
     "space", "Repos" => ToggleMark, "Mark / unmark repo (actions then run on all marked)";
