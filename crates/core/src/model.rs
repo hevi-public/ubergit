@@ -119,7 +119,15 @@ pub struct DefaultBranch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoSummary {
     pub head: Head,
+    /// Full id of the HEAD commit, `None` while unborn. A merged PR only shows while its
+    /// head is still this commit.
+    pub head_oid: Option<String>,
     pub upstream: Upstream,
+    /// The commit `@{upstream}` points to. A push, or a fetch that brings the branch new
+    /// commits, moves it, so it tells when to ask for the branch's PR again. For a local
+    /// upstream, the local branch's tip. `None` without an upstream, when it's gone, and
+    /// in bare repos.
+    pub upstream_oid: Option<String>,
     pub base: Option<BaseDivergence>,
     pub changes: ChangeCounts,
     pub stash_count: u32,

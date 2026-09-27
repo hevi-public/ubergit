@@ -48,6 +48,21 @@ fn summary(name: &str) -> RepoSummary {
     async_io::block_on(summarize(&git(), repo(name))).unwrap_or_else(|e| panic!("{name}: {e:#}"))
 }
 
+/// What git itself resolves `rev` to in a fixture repo, if anything.
+fn rev_parse(name: &str, rev: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo(name).root)
+        .args(["rev-parse", "-q", "--verify", rev])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run git");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn tracking(name: &str, ahead: u32, behind: u32) -> Upstream {
     Upstream::Tracking { name: name.into(), ahead, behind }
 }
@@ -62,10 +77,10 @@ fn discovers_every_repo_once() {
     assert_eq!(
         names,
         [
-            "ahead", "bare-repo.git", "behind", "detached", "dirty", "diverged", "feature",
-            "gone", "group/nested-svc", "legacy", "merging", "no-remote", "no-upstream",
-            "rebasing", "shallow", "stashed", "synced", "unborn", "with-submodule", "wt-linked",
-            "wt-main",
+            "ahead", "ambiguous-upstream", "bare-clone.git", "bare-repo.git", "behind",
+            "detached", "dirty", "diverged", "feature", "gone", "group/nested-svc", "legacy",
+            "local-upstream", "merging", "no-remote", "no-upstream", "rebasing", "shallow",
+            "stashed", "synced", "unborn", "with-submodule", "wt-linked", "wt-main",
         ]
     );
     assert!(repo("bare-repo.git").bare);
@@ -134,6 +149,42 @@ fn no_upstream_gone_no_remote() {
     assert!(!s.has_remote());
     assert_eq!(s.upstream, Upstream::None);
     assert_eq!(s.base, base("main", 0, 0));
+}
+
+#[test]
+fn head_and_upstream_oids_match_git() {
+    for repo in locations() {
+        let s = summary(&repo.name);
+        assert_eq!(s.head_oid, rev_parse(&repo.name, "HEAD"), "{}: HEAD", repo.name);
+        assert_eq!(s.upstream_oid, rev_parse(&repo.name, "@{upstream}"), "{}: upstream", repo.name);
+    }
+    // Which ones resolve, so the comparisons above aren't all between Nones.
+    let resolved = |name: &str| {
+        let s = summary(name);
+        (s.head_oid.is_some(), s.upstream_oid.is_some())
+    };
+    for name in ["synced", "ahead", "behind", "diverged", "feature", "local-upstream", "ambiguous-upstream"] {
+        assert_eq!(resolved(name), (true, true), "{name}");
+    }
+    for name in ["no-upstream", "gone", "detached", "bare-clone.git"] {
+        assert_eq!(resolved(name), (true, false), "{name}");
+    }
+    for name in ["unborn", "bare-repo.git"] {
+        assert_eq!(resolved(name), (false, false), "{name}");
+    }
+}
+
+#[test]
+fn local_and_ambiguous_upstreams() {
+    let s = summary("local-upstream");
+    assert_eq!(s.upstream, tracking("main", 1, 0));
+    assert_eq!(s.upstream_oid, rev_parse("local-upstream", "refs/heads/main"));
+
+    // The local branch `origin/main` sits one commit back, so picking it would show.
+    let s = summary("ambiguous-upstream");
+    assert_eq!(s.upstream, tracking("remotes/origin/main", 0, 0));
+    assert_eq!(s.upstream_oid, rev_parse("ambiguous-upstream", "refs/remotes/origin/main"));
+    assert_ne!(s.upstream_oid, rev_parse("ambiguous-upstream", "refs/heads/origin/main"));
 }
 
 #[test]
