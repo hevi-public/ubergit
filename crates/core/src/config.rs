@@ -1,6 +1,7 @@
 //! `~/.config/ubergit/config.toml`
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -16,6 +17,12 @@ pub struct Config {
     pub fetch_interval_secs: u64,
     /// Safety-net refresh of every repo's status, in case file events were missed.
     pub poll_interval_secs: u64,
+    /// Show each branch's pull request and CI status, looked up through `gh`. When off, gh
+    /// never runs. It isn't a fetch, so `auto_fetch` and `--no-fetch` leave it on.
+    pub github_status: bool,
+    /// How often every repo's PR is looked up again, at least 60 s. It also happens when
+    /// a branch's commits on the remote change, and every minute while checks run.
+    pub pr_interval_secs: u64,
     /// Shell command run by `o` to open lazygit on the selected repo; `{path}` is
     /// replaced by the repo path. Defaults to a new Terminal.app window.
     pub lazygit_command: Option<String>,
@@ -34,6 +41,8 @@ impl Default for Config {
             auto_fetch: true,
             fetch_interval_secs: 300,
             poll_interval_secs: 60,
+            github_status: true,
+            pr_interval_secs: 300,
             lazygit_command: None,
             confirm_quit: true,
             staging_hunk_mode: true,
@@ -60,6 +69,12 @@ impl Config {
             toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         config.workdir = config.workdir.map(|p| expand_home(&p));
         Ok(config)
+    }
+
+    /// `pr_interval_secs`, at least a minute: a round for ~120 repos costs 51 of
+    /// GitHub's 5,000 points an hour.
+    pub fn pr_interval(&self) -> Duration {
+        Duration::from_secs(self.pr_interval_secs.max(60))
     }
 
     pub fn lazygit_command_for(&self, repo: &Path) -> String {
@@ -99,6 +114,13 @@ mod tests {
         assert!(!toml::from_str::<Config>("confirm_quit = false").unwrap().confirm_quit);
         assert!(config.staging_hunk_mode);
         assert!(!toml::from_str::<Config>("staging_hunk_mode = false").unwrap().staging_hunk_mode);
+        assert!(config.github_status);
+        assert_eq!(config.pr_interval_secs, 300);
+        let config: Config = toml::from_str("github_status = false\npr_interval_secs = 600").unwrap();
+        assert!(!config.github_status);
+        assert_eq!(config.pr_interval(), Duration::from_secs(600));
+        let config: Config = toml::from_str("pr_interval_secs = 5").unwrap();
+        assert_eq!(config.pr_interval(), Duration::from_secs(60));
         assert!(toml::from_str::<Config>("typo = 1").is_err());
     }
 

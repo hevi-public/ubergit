@@ -7367,6 +7367,7 @@ dependencies = [
  "env_logger",
  "gpui-kit",
  "image",
+ "libc",
  "log",
  "rlimit",
  "serde",

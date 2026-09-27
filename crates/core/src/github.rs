@@ -3,13 +3,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 use crate::gh::{Gh, GhCommand, GhError};
 use crate::model::{Checks, ChecksState, PrState, PullRequest, ReviewDecision, Reviewer, ReviewerState};
-use crate::summary::primary_remote;
+use crate::summary::{primary_remote, split_upstream};
 
 /// Repos asked about per GraphQL call, which is also the per-host batch size: a host with
 /// more repos gets several calls, one after another. A call of 40 measured 28,800 nodes
@@ -93,9 +94,10 @@ pub fn parse_remote_url(url: &str) -> Option<RemoteRepo> {
 /// yet, or pushed without setting an upstream). `None` without remotes.
 pub fn remote_branch(upstream: Option<&str>, remotes: &[String], local_branch: &str) -> Option<(String, String)> {
     let remote = primary_remote(remotes, upstream)?;
-    let branch = upstream
-        .and_then(|upstream| upstream.strip_prefix(remote)?.strip_prefix('/'))
-        .unwrap_or(local_branch);
+    let branch = match upstream.and_then(|upstream| split_upstream(remotes, upstream)) {
+        Some((_, branch)) => branch,
+        None => local_branch,
+    };
     Some((remote.to_string(), branch.to_string()))
 }
 
@@ -188,9 +190,10 @@ pub fn parse_response(stdout: &[u8], targets: &[PrTarget]) -> Result<Vec<Result<
 /// Hosts gh has a working login for. Only ask gh about repos on these hosts: with
 /// `GH_ENTERPRISE_TOKEN` set, gh sends that token to whatever host other than github.com
 /// `--hostname` names, so asking about a remote on, say, a GitLab server would hand it over.
-pub async fn logged_in_hosts(gh: &Gh) -> Result<Vec<String>, GhError> {
+/// `cwd` is only where gh runs (the command log names it), e.g. the workdir.
+pub async fn logged_in_hosts(gh: &Gh, cwd: &Path) -> Result<Vec<String>, GhError> {
     // With --json, gh exits 0 whatever state the logins are in.
-    match gh.run(GhCommand::new(["auth", "status", "--json", "hosts"])).await {
+    match gh.run(GhCommand::new(["auth", "status", "--json", "hosts"]).cwd(cwd)).await {
         Ok(out) => Ok(parse_auth_hosts(&out.stdout).unwrap_or_else(|| vec!["github.com".into()])),
         // An older gh without --json here. github.com never gets the enterprise token.
         Err(GhError::Failed { stderr, .. }) if stderr.contains("unknown flag") => Ok(vec!["github.com".into()]),
@@ -203,8 +206,13 @@ pub async fn logged_in_hosts(gh: &Gh) -> Result<Vec<String>, GhError> {
 /// same repo and branch (two clones, say) are asked about once. Asks
 /// [`MAX_REPOS_PER_QUERY`] repos per call. Only gh missing or not logged in fails the
 /// whole lookup; any other failed call fails just its own repos, so the other calls'
-/// answers still count.
-pub async fn lookup(gh: &Gh, host: &str, targets: &[PrTarget]) -> Result<Vec<Result<PrLookup, String>>, GhError> {
+/// answers still count. gh runs in `cwd`, as in [`logged_in_hosts`].
+pub async fn lookup(
+    gh: &Gh,
+    host: &str,
+    targets: &[PrTarget],
+    cwd: &Path,
+) -> Result<Vec<Result<PrLookup, String>>, GhError> {
     debug_assert!(targets.iter().all(|t| t.repo.host == host));
     let mut unique: Vec<PrTarget> = Vec::new();
     let mut seen: HashMap<(&RemoteRepo, &str), usize> = HashMap::new();
@@ -221,6 +229,7 @@ pub async fn lookup(gh: &Gh, host: &str, targets: &[PrTarget]) -> Result<Vec<Res
     let mut repos = Vec::with_capacity(unique.len());
     for chunk in unique.chunks(MAX_REPOS_PER_QUERY) {
         let cmd = GhCommand::new(["api", "graphql", "--hostname", host, "--input", "-"])
+            .cwd(cwd)
             .stdin(build_query(chunk).to_string());
         let parsed = match gh.run(cmd).await {
             Ok(out) => parse_repos(&out.stdout, chunk.len()),
@@ -473,7 +482,10 @@ fn encode_path(text: &str) -> String {
 }
 
 /// `gh auth status --json hosts`: the hosts whose login works. gh uses a host's active
-/// account, so that one decides when it's marked.
+/// account, so that one decides when it's marked. gh checks each login against the API,
+/// so offline every host is in `error` (or `timeout`): only a rejected token (HTTP 401)
+/// counts as logged out. Otherwise the host stays, and its lookups fail as unreachable,
+/// keeping the last answers, rather than the app claiming the user is logged out.
 fn parse_auth_hosts(stdout: &[u8]) -> Option<Vec<String>> {
     #[derive(Deserialize)]
     struct Status {
@@ -484,10 +496,19 @@ fn parse_auth_hosts(stdout: &[u8]) -> Option<Vec<String>> {
         #[serde(default)]
         active: bool,
         state: String,
+        #[serde(default)]
+        error: String,
     }
 
     let status: Status = serde_json::from_slice(stdout).ok()?;
-    let works = |account: &Account| account.state == "success";
+    // gh's words for it, e.g. `non-200 OK status code: 401 Unauthorized body: ...`. A bare
+    // `401` could be part of a port or an address in a network error.
+    let rejected = |error: &str| error.contains("status code: 401") || error.contains("HTTP 401");
+    let works = |account: &Account| match account.state.as_str() {
+        "success" | "timeout" => true,
+        "error" => !rejected(&account.error),
+        _ => false,
+    };
     Some(
         status
             .hosts
@@ -740,6 +761,10 @@ mod tests {
         assert_eq!(remote_branch(None, &remotes, "local"), pair("origin", "local"));
         // Tracking a local branch: no remote in its name.
         assert_eq!(remote_branch(Some("main"), &remotes, "local"), pair("origin", "local"));
+        // Status's name for the upstream when a local branch is named `origin/fix` too.
+        assert_eq!(remote_branch(Some("remotes/origin/fix"), &remotes, "origin/fix"), pair("origin", "fix"));
+        assert_eq!(remote_branch(Some("remotes/team/x/fix"), &remotes, "local"), pair("team/x", "fix"));
+        assert_eq!(remote_branch(Some("remotes/x"), &["remotes".to_string()], "local"), pair("remotes", "x"));
         assert_eq!(remote_branch(None, &["fork".to_string()], "wip"), pair("fork", "wip"));
         assert_eq!(remote_branch(None, &[], "wip"), None);
         assert_eq!(remote_branch(Some("origin/wip"), &[], "wip"), None);
@@ -1135,18 +1160,38 @@ mod tests {
     fn reads_the_hosts_with_a_working_login() {
         let status = br#"{"hosts":{
             "github.com":[{"active":true,"gitProtocol":"https","host":"github.com","login":"me","scopes":"repo","state":"success","tokenSource":"keyring"}],
-            "ghe.broken.example":[{"active":true,"host":"ghe.broken.example","login":"me","state":"error","tokenSource":"keyring"}],
+            "ghe.revoked.example":[{"active":true,"host":"ghe.revoked.example","login":"me","state":"error","tokenSource":"keyring",
+                "error":"non-200 OK status code: 401 Unauthorized body: \"{\\\"message\\\": \\\"Bad credentials\\\"}\""}],
             "ghe.switched.example":[
-                {"active":false,"host":"ghe.switched.example","login":"old","state":"error"},
+                {"active":false,"host":"ghe.switched.example","login":"old","state":"error","error":"non-200 OK status code: 401 Unauthorized"},
                 {"active":true,"host":"ghe.switched.example","login":"me","state":"success"}],
             "ghe.inactive.example":[
-                {"active":true,"host":"ghe.inactive.example","login":"a","state":"timeout"},
+                {"active":true,"host":"ghe.inactive.example","login":"a","state":"error","error":"non-200 OK status code: 401 Unauthorized"},
                 {"active":false,"host":"ghe.inactive.example","login":"b","state":"success"}]
         }}"#;
         assert_eq!(
             parse_auth_hosts(status),
             Some(vec!["ghe.switched.example".to_string(), "github.com".to_string()])
         );
+        // Offline: what gh 2.98 reports when it can't reach the API. The login may be fine,
+        // even with a 401 in the port or the address.
+        let offline = br#"{"hosts":{
+            "github.com":[{"active":true,"gitProtocol":"https","host":"github.com","state":"error","tokenSource":"keyring",
+                "error":"Get \"https://api.github.com/\": dial tcp: lookup api.github.com: no such host"}],
+            "ghe.slow.example":[{"active":true,"host":"ghe.slow.example","login":"me","state":"timeout"}],
+            "ghe.port.example":[{"active":true,"host":"ghe.port.example","login":"me","state":"error",
+                "error":"Get \"https://ghe.port.example:8401/api/v3/\": dial tcp 10.0.0.1:8401: connect: connection refused"}],
+            "ghe.v6.example":[{"active":true,"host":"ghe.v6.example","login":"me","state":"error",
+                "error":"Get \"https://ghe.v6.example/api/v3/\": dial tcp [2001:db8::401]:443: i/o timeout"}]
+        }}"#;
+        assert_eq!(
+            parse_auth_hosts(offline),
+            Some(["ghe.port.example", "ghe.slow.example", "ghe.v6.example", "github.com"].map(String::from).to_vec())
+        );
+        // What gh says for a rejected token besides the status code.
+        let revoked = br#"{"hosts":{"github.com":[{"active":true,"host":"github.com","state":"error",
+            "error":"HTTP 401: Bad credentials (https://api.github.com/graphql)"}]}}"#;
+        assert_eq!(parse_auth_hosts(revoked), Some(vec![]));
         assert_eq!(parse_auth_hosts(br#"{"hosts":{}}"#), Some(vec![]));
         assert_eq!(parse_auth_hosts(b"not json"), None);
     }
@@ -1163,15 +1208,16 @@ mod tests {
     fn an_older_gh_without_json_auth_status_means_github_com_only() {
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(dir.path(), "echo 'unknown flag: --json' >&2; exit 1");
-        assert_eq!(block_on(logged_in_hosts(&gh)).unwrap(), vec!["github.com".to_string()]);
+        assert_eq!(block_on(logged_in_hosts(&gh, dir.path())).unwrap(), vec!["github.com".to_string()]);
     }
 
-    /// A stand-in for `gh api graphql` that logs its arguments, its input and how many
-    /// repos it was asked about, and answers that each one exists without PRs.
+    /// A stand-in for `gh api graphql` that logs its arguments, working directory, input
+    /// and how many repos it was asked about, and answers that each one exists without PRs.
     const ANSWER_EVERY_REPO: &str = r#"
 dir=$(dirname "$0")
 body=$(cat)
 echo "$*" >> "$dir/args"
+pwd -P >> "$dir/cwd"
 printf '%s\n' "$body" >> "$dir/bodies"
 n=$(( $(printf '%s' "$body" | grep -o '"n[0-9]*":' | wc -l) ))
 echo "$n" >> "$dir/calls"
@@ -1199,9 +1245,12 @@ printf '}}'
         };
         // The third is a second clone on the same branch.
         let targets = [on_ghe("a", None), on_ghe("b", None), on_ghe("a", Some("abc"))];
-        let results = block_on(lookup(&gh, "ghe.example.com", &targets)).unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let results = block_on(lookup(&gh, "ghe.example.com", &targets, workdir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "args"), "api graphql --hostname ghe.example.com --input -\n");
+        let cwd = workdir.path().canonicalize().unwrap();
+        assert_eq!(read(dir.path(), "cwd"), format!("{}\n", cwd.display()));
         let body: Value = serde_json::from_str(&read(dir.path(), "bodies")).unwrap();
         assert_eq!(body, build_query(&targets[..2]));
         let create = |branch: &str| {
@@ -1218,7 +1267,7 @@ printf '}}'
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(dir.path(), ANSWER_EVERY_REPO);
         let targets: Vec<PrTarget> = (0..85).map(|i| target("o", "r", &format!("b{i}"), None)).collect();
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "calls"), "40\n40\n5\n");
         assert_eq!(results.len(), 85);
@@ -1236,7 +1285,7 @@ printf '}}'
              echo \"gh: Could not resolve to a Repository with the name 'hevi-public/does-not-exist-xyz'.\" >&2\nexit 1"
         );
         let gh = fake_gh(dir.path(), &script);
-        let results = block_on(lookup(&gh, "github.com", &partial_failure_targets(MERGED_TIP))).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &partial_failure_targets(MERGED_TIP), dir.path())).unwrap();
         assert_eq!(results[0].as_ref().unwrap().pr.as_ref().map(|pr| pr.number), Some(15));
         assert!(results[1].as_ref().unwrap_err().starts_with("Could not resolve"));
     }
@@ -1247,22 +1296,22 @@ printf '}}'
         let targets = [target("o", "r", "b", None)];
 
         let gh = fake_gh(dir.path(), "cat >/dev/null; echo 'gh auth login' >&2; exit 4");
-        let result = block_on(lookup(&gh, "github.com", &targets));
+        let result = block_on(lookup(&gh, "github.com", &targets, dir.path()));
         assert!(matches!(result, Err(GhError::NotLoggedIn { .. })), "{result:?}");
         // Nothing to ask, so gh doesn't run.
-        assert_eq!(block_on(lookup(&gh, "github.com", &[])).unwrap(), vec![]);
+        assert_eq!(block_on(lookup(&gh, "github.com", &[], dir.path())).unwrap(), vec![]);
 
         // Any other failure is the repos'.
         let gh = fake_gh(
             dir.path(),
             r#"cat >/dev/null; echo '{"errors":[{"message":"Something went wrong"}]}'; echo 'gh: Something went wrong' >&2; exit 1"#,
         );
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
         assert_eq!(results, vec![Err("gh: Something went wrong".into())]);
 
         // gh succeeded, but that isn't an answer.
         let gh = fake_gh(dir.path(), "cat >/dev/null; echo 'not json'");
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
         assert!(results[0].as_ref().unwrap_err().starts_with("unexpected answer from GitHub"));
     }
 
@@ -1276,7 +1325,7 @@ printf '}}'
         );
         let gh = fake_gh(dir.path(), &script);
         let targets: Vec<PrTarget> = (0..45).map(|i| target("o", "r", &format!("b{i}"), None)).collect();
-        let results = block_on(lookup(&gh, "github.com", &targets)).unwrap();
+        let results = block_on(lookup(&gh, "github.com", &targets, dir.path())).unwrap();
 
         assert_eq!(read(dir.path(), "calls"), "40\n");
         assert!(results[..40].iter().all(|result| result.as_ref().is_ok_and(|found| found.pr.is_none())));

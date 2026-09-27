@@ -80,6 +80,12 @@ origin detached; clone detached; g -C "$DIR/detached" checkout -q HEAD~1
 origin no-upstream; clone no-upstream
 g -C "$DIR/no-upstream" checkout -q -b spike; commit "$DIR/no-upstream" spike.txt "spike"
 
+# --- branch pushed without -u, then one more local commit: no upstream, but origin/wip
+origin pushed-no-upstream; clone pushed-no-upstream
+g -C "$DIR/pushed-no-upstream" checkout -q -b wip; commit "$DIR/pushed-no-upstream" wip.txt "wip"
+g -C "$DIR/pushed-no-upstream" push -q origin wip 2>/dev/null
+commit "$DIR/pushed-no-upstream" wip.txt "wip 2"
+
 # --- upstream gone (deleted on remote, pruned locally)
 origin gone; clone gone
 g -C "$DIR/gone" checkout -q -b old-feature; commit "$DIR/gone" old.txt "old"

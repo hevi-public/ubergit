@@ -128,6 +128,11 @@ pub struct RepoSummary {
     /// upstream, the local branch's tip. `None` without an upstream, when it's gone, and
     /// in bare repos.
     pub upstream_oid: Option<String>,
+    /// The commit of the branch a PR for HEAD's branch would come from, on its remote
+    /// ([`crate::github::remote_branch`]). Usually the upstream's, but a branch pushed
+    /// without `-u` has no upstream and still has `<remote>/<branch>`, which a push moves.
+    /// `None` when detached, without remotes, or before the branch is pushed.
+    pub remote_branch_oid: Option<String>,
     pub base: Option<BaseDivergence>,
     pub changes: ChangeCounts,
     pub stash_count: u32,
