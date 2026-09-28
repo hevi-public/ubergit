@@ -802,7 +802,7 @@ impl RepoStore {
         let Some(group) = self.entry(root).map(|entry| self.group_root(entry).to_path_buf()) else {
             return;
         };
-        self.open_queue.repo(group, Instant::now() + open_prs::AFTER_PUSH);
+        self.open_queue.repo_after(group, Instant::now() + open_prs::AFTER_PUSH);
         self.pump_open(cx);
     }
 
@@ -835,7 +835,10 @@ impl RepoStore {
         };
         let hosts = self.gh_status.hosts().map(<[String]>::to_vec);
         let Some(hosts) = hosts.filter(|_| !roots.is_empty()) else {
+            // Nothing to ask, but something later may still be queued: pump, or its timer
+            // is never set. Each re-entry sees a strictly smaller queue, so this ends.
             self.open_queue.finished();
+            self.pump_open(cx);
             return;
         };
         log::debug!(

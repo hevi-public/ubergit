@@ -1950,14 +1950,15 @@ impl Workspace {
             let store = self.store.read(cx);
             let rows = self.overview_rows(store, 80);
             let url = self.overview_cursor(&rows).and_then(|row| rows[row].pr.as_ref()).map(|row| row.pr.url.clone());
+            // With no PR under the cursor there's nothing to open; fall through to the
+            // selected repo's, which says why when it has none either.
             match url.as_deref().map(pr::open_https) {
-                Some(OpenAction::Open(url)) => cx.open_url(&url),
+                Some(OpenAction::Open(url)) => return cx.open_url(&url),
                 Some(OpenAction::Message(message) | OpenAction::LookUp(message)) => {
-                    self.show_message("Pull request", message, window, cx)
+                    return self.show_message("Pull request", message, window, cx);
                 }
                 None => {}
             }
-            return;
         }
         let Some(root) = self.selected_root(cx) else { return };
         let store = self.store.read(cx);

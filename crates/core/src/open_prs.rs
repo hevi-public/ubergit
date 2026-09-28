@@ -270,7 +270,8 @@ async fn ask_open(
     };
     match once(repos, viewer).await? {
         Ok(answer) => Ok(answer),
-        Err(message) if repos.len() < 2 => Ok((None, vec![Err(message)])),
+        // One result per repo, always: `nodes` has to stay aligned with what was asked.
+        Err(message) if repos.len() < 2 => Ok((None, repos.iter().map(|_| Err(message.clone())).collect())),
         Err(_) => {
             let mut viewer_login = None;
             let mut nodes = Vec::with_capacity(repos.len());
@@ -650,9 +651,24 @@ pub fn stale(checked: Option<SystemTime>, now: SystemTime) -> bool {
 pub struct OpenQueue {
     /// Every repo, and the review requests.
     round: bool,
-    /// Single repos, by their main checkout, and when each is due.
-    repos: BTreeMap<PathBuf, Instant>,
+    /// Single repos, by their main checkout.
+    repos: BTreeMap<PathBuf, Queued>,
     running: bool,
+}
+
+/// When a queued repo's lookup is wanted, and the earliest it may run.
+#[derive(Clone, Copy, Debug)]
+struct Queued {
+    /// The soonest anything asked for it.
+    at: Instant,
+    /// A push GitHub may not have seen yet: never look up before this.
+    not_before: Option<Instant>,
+}
+
+impl Queued {
+    fn due(&self) -> Instant {
+        self.not_before.map_or(self.at, |floor| self.at.max(floor))
+    }
 }
 
 /// What [`OpenQueue::next`] says to do.
@@ -673,10 +689,20 @@ impl OpenQueue {
         self.round = true;
     }
 
-    /// One repo, from `at`: the selected one now, a pushed one a moment later.
+    /// One repo, wanted by `at`: selecting it wants an answer as soon as there is one, so
+    /// the soonest request wins. It still can't run before a push's floor.
     pub fn repo(&mut self, root: PathBuf, at: Instant) {
-        let due = self.repos.entry(root).or_insert(at);
-        *due = (*due).min(at);
+        let queued = self.repos.entry(root).or_insert(Queued { at, not_before: None });
+        queued.at = queued.at.min(at);
+    }
+
+    /// One repo, never before `at`: a push has to reach GitHub first. The floor is kept
+    /// apart from the wanted time so that selecting the repo, before or after, can't drag
+    /// the lookup in front of the push and consume the entry with it. Pushing twice keeps
+    /// the later floor.
+    pub fn repo_after(&mut self, root: PathBuf, at: Instant) {
+        let queued = self.repos.entry(root).or_insert(Queued { at, not_before: Some(at) });
+        queued.not_before = Some(queued.not_before.map_or(at, |floor| floor.max(at)));
     }
 
     /// What to do now. Nothing runs while gh can't be asked (`ready` false); what's queued
@@ -689,17 +715,18 @@ impl OpenQueue {
             // A round asks about every repo as GitHub sees it now, so it covers the repos
             // already due. One queued for later isn't: a push GitHub hasn't seen yet needs
             // the lookup this round is too early for.
-            self.repos.retain(|_, at| *at > now);
+            self.repos.retain(|_, queued| queued.due() > now);
             self.running = true;
             return OpenNext::Start {
                 round: true,
                 repos: Vec::new(),
             };
         }
-        let due: Vec<PathBuf> = self.repos.iter().filter(|(_, at)| **at <= now).map(|(root, _)| root.clone()).collect();
+        let due: Vec<PathBuf> =
+            self.repos.iter().filter(|(_, q)| q.due() <= now).map(|(root, _)| root.clone()).collect();
         if due.is_empty() {
-            return match self.repos.values().min() {
-                Some(&at) => OpenNext::Wait(at),
+            return match self.repos.values().map(Queued::due).min() {
+                Some(at) => OpenNext::Wait(at),
                 None => OpenNext::Idle,
             };
         }
@@ -816,7 +843,14 @@ pub async fn refresh(git: &Git, gh: &Gh, cwd: &Path, hosts: &[String], roots: Ve
             true => match review_requests(gh, host, cwd).await {
                 Ok(found) => Some(found),
                 Err(GhError::NotInstalled) => {
+                    // Keep the viewer this host already gave: without it every PR of the
+                    // user's reads as a teammate's.
                     status = Some(GhStatus::NotInstalled);
+                    host_answers.push(HostAnswer {
+                        host: host.to_string(),
+                        viewer: found.viewer,
+                        review: None,
+                    });
                     break;
                 }
                 Err(err) => Some(Err(err.to_string())),
@@ -1283,6 +1317,24 @@ if [ -e "$dir/answer$n" ]; then cat "$dir/answer$n"; else echo 'gh: HTTP 502' >&
         assert_eq!(queue.next(true, secs(14)), OpenNext::Start { round: false, repos: vec!["e".into()] });
         queue.finished();
         assert_eq!(queue.next(true, secs(15)), OpenNext::Idle);
+
+        // A push wants GitHub to have seen it, so it can only move a repo's lookup later.
+        // Selecting the repo queues it for now; pushing must not keep that time.
+        queue.repo("f".into(), secs(20));
+        queue.repo_after("f".into(), secs(25));
+        assert_eq!(queue.next(true, secs(20)), OpenNext::Wait(secs(25)));
+        assert_eq!(queue.next(true, secs(25)), OpenNext::Start { round: false, repos: vec!["f".into()] });
+        queue.finished();
+        // Pushing twice waits for the second push, not the first.
+        queue.repo_after("g".into(), secs(30));
+        queue.repo_after("g".into(), secs(34));
+        assert_eq!(queue.next(true, secs(30)), OpenNext::Wait(secs(34)));
+        // Selecting it meanwhile still can't drag the lookup in front of the push.
+        queue.repo("g".into(), secs(31));
+        assert_eq!(queue.next(true, secs(31)), OpenNext::Wait(secs(34)));
+        assert_eq!(queue.next(true, secs(34)), OpenNext::Start { round: false, repos: vec!["g".into()] });
+        queue.finished();
+        assert_eq!(queue.next(true, secs(40)), OpenNext::Idle);
     }
 
     #[test]
