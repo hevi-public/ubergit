@@ -127,6 +127,10 @@ every mark hidden the action stops and says so, rather than falling back to the 
 - `U` fast-forwards the marked repos, or, with nothing marked, every listed repo that can be.
 - `F` fetches the marked repos, or, with nothing marked, every listed one.
 
+A filter lists a main checkout whose worktrees it matched, so the group has a header. That
+row isn't one the filter named, so `a`, `F` and `U` leave it alone; mark it yourself if you
+want it acted on.
+
 Nothing is half-done. Repos that are busy, bare, mid-rebase or mid-merge are skipped with a
 reason, and so are repos with uncommitted changes for `c`, `m` and `U`. The others run in
 parallel, and a popup fills in each repo's result as it finishes.

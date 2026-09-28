@@ -599,12 +599,8 @@ impl Workspace {
     /// group is expanded. A filter lists the worktrees it matches, collapsed or not, with
     /// their main checkout. Only these are acted on; background work covers every repo.
     fn listed_repos(&self, store: &RepoStore) -> Vec<usize> {
-        let filter = self.filters.get(&View::Repos).filter(|f| !f.is_empty()).map(|f| f.to_lowercase());
-        let matches = |ix: usize| {
-            filter
-                .as_ref()
-                .is_none_or(|f| Self::item_text(View::Repos, ix, store).to_lowercase().contains(f))
-        };
+        let filter = self.repos_filter();
+        let matches = |ix: usize| Self::matches_filter(View::Repos, ix, store, filter.as_deref());
         let mut rows = Vec::with_capacity(store.repos.len());
         let mut ix = 0;
         while ix < store.repos.len() {
@@ -619,6 +615,21 @@ impl Workspace {
             ix = next;
         }
         rows
+    }
+
+    /// The Repos panel's filter, lowercased; `None` when there isn't one.
+    fn repos_filter(&self) -> Option<String> {
+        self.filters.get(&View::Repos).filter(|f| !f.is_empty()).map(|f| f.to_lowercase())
+    }
+
+    /// Whether the row at `ix` is one the filter named. True when there's no filter.
+    fn matches_filter(view: View, ix: usize, store: &RepoStore, filter: Option<&str>) -> bool {
+        filter.is_none_or(|f| Self::item_text(view, ix, store).to_lowercase().contains(f))
+    }
+
+    /// Whether the repo at `ix` is one the Repos filter named.
+    pub(crate) fn matches_repo_filter(&self, ix: usize, store: &RepoStore) -> bool {
+        Self::matches_filter(View::Repos, ix, store, self.repos_filter().as_deref())
     }
 
     /// Shows or hides worktree groups, keeping the selected repo selected, or its main
@@ -1855,7 +1866,7 @@ impl Workspace {
         if marked.as_ref().is_some_and(|roots| roots.is_empty()) {
             return self.no_listed_marks("Fetch all", window, cx);
         }
-        let roots = marked.unwrap_or_else(|| self.listed_roots(cx));
+        let roots = marked.unwrap_or_else(|| self.listed_targets(cx));
         self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
     }
 
