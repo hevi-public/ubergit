@@ -210,6 +210,18 @@ fn inbox(store: &RepoStore, width: usize) -> Vec<Row> {
     let all: Vec<&Item> = sections.iter().flat_map(|(_, items)| items).collect();
     let widths = Widths::of_refs(&all, width);
     let mut rows = Vec::new();
+    // Say the scope once. Next to "This repo", the tab's name doesn't make clear that this
+    // one spans the workdir rather than the selected repo.
+    let mut scope = Line::new();
+    scope.color(
+        match listed.len() {
+            1 => "Open pull requests across 1 repository".to_string(),
+            n => format!("Open pull requests across {n} repositories"),
+        },
+        Palette::dim(),
+    );
+    rows.push(Row::line(scope));
+    rows.push(Row::line(Line::new()));
     for (ix, (title, items)) in sections.iter().enumerate() {
         if ix > 0 {
             rows.push(Row::line(Line::new()));
