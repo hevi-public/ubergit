@@ -345,6 +345,8 @@ impl Workspace {
                 let entry = &store.repos[ix];
                 let s = entry.summary.as_ref()?;
                 let branch = match &s.head {
+                    // Blanked below, so it needs no width here.
+                    Head::Branch(b) if entry.main_repo.is_some() && branch_repeats_name(b, &entry.short_name()) => 0,
                     Head::Branch(b) | Head::Unborn(b) => b.chars().count(),
                     Head::Detached(_) => "@1234567".len(),
                 };

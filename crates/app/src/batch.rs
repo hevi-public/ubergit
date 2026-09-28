@@ -126,8 +126,10 @@ impl Workspace {
     pub fn toggle_mark_all(&mut self, _: &ToggleMarkAll, _: &mut Window, cx: &mut Context<Self>) {
         let listed = self.listed_targets(cx);
         if listed.iter().all(|root| self.marked.contains(root)) {
-            for root in &listed {
-                self.marked.remove(root);
+            // Clear everything on screen, not just what the filter named: a header row
+            // marked by hand would otherwise be beyond this key's reach for good.
+            for root in self.listed_roots(cx) {
+                self.marked.remove(&root);
             }
         } else {
             self.marked.extend(listed);
@@ -356,22 +358,25 @@ impl Workspace {
         });
         if roots.is_empty() {
             // Don't claim nothing is behind when the ones that are just aren't on screen.
-            let hidden = store.repos.len() - self.listed_roots(cx).len();
-            let unlisted = match hidden {
+            let skipped = store.repos.len() - self.listed_targets(cx).len();
+            let unlisted = match skipped {
                 0 => String::new(),
-                1 => "\n\n1 repository isn't listed, and wasn't looked at. Press Z to show \
-                      worktrees, or clear the filter."
+                1 => "\n\n1 repository wasn't looked at: hidden by the filter or a collapsed \
+                      group, or listed only to head one. Press Z to show worktrees, clear the \
+                      filter, or mark it and press U again."
                     .to_string(),
                 n => format!(
-                    "\n\n{n} repositories aren't listed, and weren't looked at. Press Z to show \
-                     worktrees, or clear the filter."
+                    "\n\n{n} repositories weren't looked at: hidden by the filter or a collapsed \
+                     group, or listed only to head one. Press Z to show worktrees, clear the \
+                     filter, or mark them and press U again."
                 ),
             };
             return self.show_message(
                 "Fast-forward",
                 format!(
-                    "No repos to update: none of the listed ones are on a branch that is behind \
-                     its upstream and free of uncommitted changes.\nFetch first with F.{unlisted}"
+                    "No repos to update: none of the repos the filter matched are on a branch \
+                     that is behind its upstream and free of uncommitted changes.\n\
+                     Fetch first with F.{unlisted}"
                 ),
                 window,
                 cx,

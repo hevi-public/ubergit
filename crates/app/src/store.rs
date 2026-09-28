@@ -379,6 +379,12 @@ impl RepoStore {
             (group, r.main_repo.is_some(), r.location.name.clone())
         });
 
+        // Repos that are gone keep nothing: these two only ever grew.
+        self.open.retain(|root, _| self.repos.iter().any(|r| &r.location.root == root));
+        let known: std::collections::HashSet<&str> =
+            self.open.values().filter_map(|open| open.listing.as_ref()).filter_map(listed_repo_name).collect();
+        self.pr_details.retain(|id, _| known.contains(id.repo.as_str()));
+
         let locations: Vec<RepoLocation> = self
             .repos
             .iter()
@@ -952,5 +958,13 @@ fn describe(answer: &Answer) -> String {
         Answer::NotOnGitHub => "not on GitHub".into(),
         Answer::Failed(message) => format!("failed: {message}"),
         Answer::NotAsked => "not asked".into(),
+    }
+}
+
+/// The GitHub repo a listing is of, for pruning details of PRs no repo lists any more.
+fn listed_repo_name(listing: &Listing) -> Option<&str> {
+    match listing {
+        Listing::Prs(prs) => Some(prs.repo.as_str()),
+        _ => None,
     }
 }

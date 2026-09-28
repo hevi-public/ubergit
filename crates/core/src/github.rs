@@ -321,8 +321,23 @@ impl Answer {
 pub(crate) enum Failed {
     /// gh is missing or not logged in: every other call would fail the same way.
     Gh(GhError),
-    /// This call failed, say it timed out; others may still work.
+    /// GitHub answered and refused the query as a whole: a rate limit, an org's SAML, a
+    /// query it won't accept. Asking again for fewer repos only repeats the refusal, and
+    /// while rate limited it spends more of the budget that ran out.
+    Rejected(String),
+    /// The call itself didn't finish — it timed out, gh died, the host 5xx'd. Others may
+    /// still work, and so may a smaller ask.
     Call(String),
+}
+
+impl Failed {
+    /// Why it failed, for a caller that shows one repo's error either way.
+    pub(crate) fn message(self) -> String {
+        match self {
+            Failed::Gh(err) => err.to_string(),
+            Failed::Rejected(message) | Failed::Call(message) => message,
+        }
+    }
 }
 
 /// Runs one query on `host`. `gh api graphql` exits 1 when part of a query failed, but
@@ -332,7 +347,8 @@ pub(crate) async fn ask(gh: &Gh, host: &str, body: &Value, cwd: &Path) -> Result
         .cwd(cwd)
         .stdin(body.to_string());
     match gh.run(cmd).await {
-        Ok(out) => Answer::parse(&out.stdout).map_err(Failed::Call),
+        // gh ran and GitHub answered; an answer we can't read is GitHub's refusal.
+        Ok(out) => Answer::parse(&out.stdout).map_err(Failed::Rejected),
         Err(err @ (GhError::NotInstalled | GhError::NotLoggedIn { .. })) => Err(Failed::Gh(err)),
         Err(err) => match &err {
             GhError::Failed { stdout, .. } => Answer::parse(stdout).map_err(|_| Failed::Call(err.to_string())),
@@ -454,7 +470,7 @@ pub async fn pr_detail(
     match ask(gh, host, &build_detail_query(repo, number), cwd).await {
         Ok(answer) => Ok(detail_from(answer, repo)),
         Err(Failed::Gh(err)) => Err(err),
-        Err(Failed::Call(message)) => Ok(Err(message)),
+        Err(failed) => Ok(Err(failed.message())),
     }
 }
 

@@ -10,7 +10,7 @@ use ubergit_core::{Head, PrState};
 
 use crate::pr;
 use crate::store::{PrId, RepoStore};
-use crate::text::{Line, age, truncate};
+use crate::text::{Line, age, truncate, truncate_middle};
 use crate::theme::Palette;
 
 pub const TABS: [&str; 2] = ["This repo", "Inbox"];
@@ -212,16 +212,18 @@ fn inbox(store: &RepoStore, width: usize) -> Vec<Row> {
     let mut rows = Vec::new();
     // Say the scope once. Next to "This repo", the tab's name doesn't make clear that this
     // one spans the workdir rather than the selected repo.
-    let mut scope = Line::new();
-    scope.color(
-        match listed.len() {
-            1 => "Open pull requests across 1 repository".to_string(),
-            n => format!("Open pull requests across {n} repositories"),
-        },
-        Palette::dim(),
-    );
-    rows.push(Row::line(scope));
-    rows.push(Row::line(Line::new()));
+    if !listed.is_empty() {
+        let mut scope = Line::new();
+        scope.color(
+            match listed.len() {
+                1 => "Open pull requests across 1 repository".to_string(),
+                n => format!("Open pull requests across {n} repositories"),
+            },
+            Palette::dim(),
+        );
+        rows.push(Row::line(scope));
+        rows.push(Row::line(Line::new()));
+    }
     for (ix, (title, items)) in sections.iter().enumerate() {
         if ix > 0 {
             rows.push(Row::line(Line::new()));
@@ -302,6 +304,9 @@ struct Widths {
     number: usize,
     title: usize,
     author: usize,
+    /// The checkout cell. Sized like the rest, and cut like the rest: worktree names run
+    /// to 40 characters and would otherwise push the row past the pane.
+    local: usize,
 }
 
 /// The widest a word can be (`approved`).
@@ -328,6 +333,7 @@ impl Widths {
             number,
             title: width.saturating_sub(fixed).max(20),
             author,
+            local,
         }
     }
 }
@@ -369,7 +375,8 @@ impl Item<'_> {
                 line.color("local", Palette::dim());
             }
             Some(worktree) => {
-                line.color(worktree, Palette::green());
+                // Cut in the middle: agent worktrees differ only in a trailing hash.
+                line.color(truncate_middle(worktree, widths.local), Palette::green());
             }
             None => {}
         }

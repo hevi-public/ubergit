@@ -254,8 +254,10 @@ fn read_review(mut answer: Answer) -> Result<Vec<ReviewRequest>, String> {
 }
 
 /// Asks about `repos` in one call. One repo with thousands of PRs can make the whole call
-/// time out, taking the others with it, so a call that fails is tried again as two halves,
-/// once. Only gh missing or logged out is a [`GhError`].
+/// time out, taking the others with it, so a call that didn't finish is tried again as two
+/// halves, once. A call GitHub answered and refused isn't: halving would repeat the refusal,
+/// and a rate limit would see three times the calls that exhausted it. Only gh missing or
+/// logged out is a [`GhError`].
 async fn ask_open(
     gh: &Gh,
     host: &str,
@@ -263,15 +265,25 @@ async fn ask_open(
     viewer: bool,
     cwd: &Path,
 ) -> Result<(Option<String>, Vec<Result<RepoNode, String>>), GhError> {
+    // Nothing to ask about: don't spend a doomed call finding that out.
+    if repos.is_empty() {
+        return Ok((None, Vec::new()));
+    }
     let once = async |repos: &[RemoteRepo], viewer: bool| match github::ask(gh, host, &build_open_query(repos, viewer), cwd).await {
         Ok(answer) => Ok(Ok(read_open(answer, repos.len(), viewer))),
         Err(Failed::Gh(err)) => Err(err),
-        Err(Failed::Call(message)) => Ok(Err(message)),
+        Err(failed) => Ok(Err(failed)),
+    };
+    // One result per repo, always: `nodes` has to stay aligned with what was asked.
+    let all_failed = |failed: Failed, repos: &[RemoteRepo]| {
+        let message = failed.message();
+        (None, repos.iter().map(|_| Err(message.clone())).collect::<Vec<_>>())
     };
     match once(repos, viewer).await? {
         Ok(answer) => Ok(answer),
-        // One result per repo, always: `nodes` has to stay aligned with what was asked.
-        Err(message) if repos.len() < 2 => Ok((None, repos.iter().map(|_| Err(message.clone())).collect())),
+        // GitHub refused, so it would refuse each half too.
+        Err(failed @ Failed::Rejected(_)) => Ok(all_failed(failed, repos)),
+        Err(failed) if repos.len() < 2 => Ok(all_failed(failed, repos)),
         Err(_) => {
             let mut viewer_login = None;
             let mut nodes = Vec::with_capacity(repos.len());
@@ -282,7 +294,7 @@ async fn ask_open(
                         viewer_login = viewer_login.or(login);
                         nodes.extend(found);
                     }
-                    Err(message) => nodes.extend(half.iter().map(|_| Err(message.clone()))),
+                    Err(failed) => nodes.extend(all_failed(failed, half).1),
                 }
             }
             Ok((viewer_login, nodes))
@@ -374,7 +386,7 @@ pub async fn review_requests(gh: &Gh, host: &str, cwd: &Path) -> Result<Result<V
     match github::ask(gh, host, &build_review_query(), cwd).await {
         Ok(answer) => Ok(read_review(answer)),
         Err(Failed::Gh(err)) => Err(err),
-        Err(Failed::Call(message)) => Ok(Err(message)),
+        Err(failed) => Ok(Err(failed.message())),
     }
 }
 
@@ -1335,6 +1347,19 @@ if [ -e "$dir/answer$n" ]; then cat "$dir/answer$n"; else echo 'gh: HTTP 502' >&
         assert_eq!(queue.next(true, secs(34)), OpenNext::Start { round: false, repos: vec!["g".into()] });
         queue.finished();
         assert_eq!(queue.next(true, secs(40)), OpenNext::Idle);
+
+        // Asking again for a repo already queued only ever brings its lookup forward.
+        queue.repo("h".into(), secs(50));
+        queue.repo("h".into(), secs(60));
+        assert_eq!(queue.next(true, secs(50)), OpenNext::Start { round: false, repos: vec!["h".into()] });
+        queue.finished();
+        // A floor is a floor, not the time: a lookup wanted later still waits for it.
+        queue.repo("i".into(), secs(70));
+        queue.repo_after("i".into(), secs(65));
+        assert_eq!(queue.next(true, secs(65)), OpenNext::Wait(secs(70)));
+        assert_eq!(queue.next(true, secs(70)), OpenNext::Start { round: false, repos: vec!["i".into()] });
+        queue.finished();
+        assert_eq!(queue.next(true, secs(80)), OpenNext::Idle);
     }
 
     #[test]
