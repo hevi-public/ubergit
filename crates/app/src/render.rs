@@ -15,7 +15,7 @@ use crate::keymap::{self, *};
 use crate::overview;
 use crate::pr;
 use crate::store::{RepoEntry, RepoStore};
-use crate::text::{Line, age, truncate};
+use crate::text::{Line, age, truncate, truncate_middle};
 use crate::theme::{FONT, FONT_SIZE, LINE_HEIGHT, Palette};
 use crate::workspace::{Dialog, DiffHalf, MainContent, MenuItem, Panel, ScreenMode, TextKind, View, Workspace};
 
@@ -32,6 +32,10 @@ const CHAR_WIDTH: Pixels = px(7.83);
 /// down to the smaller before it cuts the names.
 const MAX_BRANCH: usize = 22;
 const MIN_BRANCH: usize = 10;
+/// The name column's cap, as [`MAX_BRANCH`] is the branch's. Agent worktrees are named
+/// after a task and a hash, up to ~40 characters, and one of them sized the column for
+/// every row in the panel.
+const MAX_NAME: usize = 24;
 
 /// Widths of the Repos panel's name and branch, in characters.
 #[derive(Clone, Copy, Default)]
@@ -40,6 +44,13 @@ struct RepoColumns {
     branch: usize,
     /// Some repo has worktrees, so names make room for the tree's markers.
     tree: bool,
+}
+
+/// Whether a worktree's branch only repeats its directory name. Tools that make a
+/// worktree per task name both the same way — Claude Code's is `worktree-<dir>` — so the
+/// branch column would spend its width saying the name column's words again.
+fn branch_repeats_name(branch: &str, name: &str) -> bool {
+    branch == name || branch.strip_prefix("worktree-") == Some(name)
 }
 
 /// Before a name while some repo has worktrees: a group's `▸` (collapsed) or `▾`, a
@@ -351,7 +362,7 @@ impl Workspace {
             .iter()
             .map(|&ix| {
                 let marker = if tree { tree_marker(store, ix, false).chars().count() } else { 0 };
-                marker + store.repos[ix].short_name().chars().count()
+                marker + store.repos[ix].short_name().chars().count().min(MAX_NAME)
             })
             .max()
             .unwrap_or(0);
@@ -498,7 +509,7 @@ impl Workspace {
         line.push(" ");
         let marker = if columns.tree { marker } else { "" };
         line.color(marker, Palette::dim());
-        line.push(truncate(&entry.short_name(), name_width.saturating_sub(marker.chars().count())));
+        line.push(truncate_middle(&entry.short_name(), name_width.saturating_sub(marker.chars().count())));
         line.pad_to(name_end);
         let Some(s) = &entry.summary else {
             if let Some(err) = &entry.error {
@@ -507,9 +518,15 @@ impl Workspace {
             return line;
         };
         match &s.head {
-            Head::Branch(b) | Head::Unborn(b) => line.color(truncate(b, columns.branch), Palette::blue()),
-            Head::Detached(oid) => line.color(format!("@{}", oid.get(..7).unwrap_or(oid)), Palette::yellow()),
-        };
+            // The name beside it already spelled this out.
+            Head::Branch(b) if entry.main_repo.is_some() && branch_repeats_name(b, &entry.short_name()) => {}
+            Head::Branch(b) | Head::Unborn(b) => {
+                line.color(truncate(b, columns.branch), Palette::blue());
+            }
+            Head::Detached(oid) => {
+                line.color(format!("@{}", oid.get(..7).unwrap_or(oid)), Palette::yellow());
+            }
+        }
         upstream_spans(&mut line, &s.upstream);
         if let Some(badge) = pr::badge(&pr) {
             line.append(badge);

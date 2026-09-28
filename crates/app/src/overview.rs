@@ -112,7 +112,9 @@ fn this_repo(store: &RepoStore, width: usize) -> Vec<Row> {
     match open.and_then(|open| open.listing.as_ref()) {
         Some(Listing::Prs(prs)) => {
             header.bold(&prs.repo, Palette::fg());
-            header.color(format!("  {} open", prs.total), Palette::cyan());
+            // "on GitHub": the Repos panel's `· N PR` counts only worktrees, so the two
+            // numbers answer different questions and shouldn't read as a contradiction.
+            header.color(format!("  {} open on GitHub", prs.total), Palette::cyan());
             if let Some(fork) = &prs.fork {
                 header.color(format!("  (the parent of {fork})"), Palette::dim());
             }
