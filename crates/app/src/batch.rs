@@ -64,11 +64,25 @@ impl Workspace {
         self.listed_roots(cx).into_iter().filter(|root| self.marked.contains(root)).collect()
     }
 
-    /// Every listed repo, in Repos-panel order.
+    /// Every listed repo, in Repos-panel order: the rows on screen, whether the filter
+    /// named them or they only head a group.
     pub(crate) fn listed_roots(&self, cx: &App) -> Vec<PathBuf> {
         let store = self.store.read(cx);
         self.visible(View::Repos, store)
             .into_iter()
+            .map(|ix| store.repos[ix].location.root.clone())
+            .collect()
+    }
+
+    /// The listed repos an action covering "all of them" runs on: those the filter
+    /// matched. A main checkout listed only so its matching worktrees have a header isn't
+    /// one — the filter never named it, and `a`, `F` and `U` would otherwise sweep it in.
+    /// Marking such a row by hand still acts on it: it's visible, so it was deliberate.
+    pub(crate) fn listed_targets(&self, cx: &App) -> Vec<PathBuf> {
+        let store = self.store.read(cx);
+        self.visible(View::Repos, store)
+            .into_iter()
+            .filter(|&ix| self.matches_repo_filter(ix, store))
             .map(|ix| store.repos[ix].location.root.clone())
             .collect()
     }
@@ -107,7 +121,7 @@ impl Workspace {
 
     /// Marks every listed (filtered) repo, or unmarks them if all are marked already.
     pub fn toggle_mark_all(&mut self, _: &ToggleMarkAll, _: &mut Window, cx: &mut Context<Self>) {
-        let listed = self.listed_roots(cx);
+        let listed = self.listed_targets(cx);
         if listed.iter().all(|root| self.marked.contains(root)) {
             for root in &listed {
                 self.marked.remove(root);
@@ -313,7 +327,8 @@ impl Workspace {
     }
 
     /// `U`: fast-forward repos that are behind their upstream: the marked ones (saying why
-    /// any are skipped), or every repo that can be.
+    /// any are skipped), or every listed one that can be. Repos a filter or a collapsed
+    /// group hides aren't listed, so they aren't touched; the message says how many.
     pub fn fast_forward_all(&mut self, _: &FastForwardAll, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         if let Some((done, total)) = store.fetch_round {
@@ -329,7 +344,7 @@ impl Workspace {
             return self.no_listed_marks("Fast-forward", window, cx);
         }
         let roots = marked.clone().unwrap_or_else(|| {
-            self.listed_roots(cx)
+            self.listed_targets(cx)
                 .into_iter()
                 .filter(|root| {
                     store.entry(root).is_some_and(|r| precheck(r).is_ok_and(|s| fast_forward_check(s).is_none()))
@@ -337,10 +352,24 @@ impl Workspace {
                 .collect()
         });
         if roots.is_empty() {
+            // Don't claim nothing is behind when the ones that are just aren't on screen.
+            let hidden = store.repos.len() - self.listed_roots(cx).len();
+            let unlisted = match hidden {
+                0 => String::new(),
+                1 => "\n\n1 repository isn't listed, and wasn't looked at. Press Z to show \
+                      worktrees, or clear the filter."
+                    .to_string(),
+                n => format!(
+                    "\n\n{n} repositories aren't listed, and weren't looked at. Press Z to show \
+                     worktrees, or clear the filter."
+                ),
+            };
             return self.show_message(
                 "Fast-forward",
-                "No repos to update: none are on a branch that is behind its upstream and \
-                 free of uncommitted changes.\nFetch first with F.",
+                format!(
+                    "No repos to update: none of the listed ones are on a branch that is behind \
+                     its upstream and free of uncommitted changes.\nFetch first with F.{unlisted}"
+                ),
                 window,
                 cx,
             );
