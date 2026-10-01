@@ -1,9 +1,9 @@
 //! The root view: lazygit's panels plus the Repos column, focus, selection and actions.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -351,6 +351,8 @@ pub struct Workspace {
     pub layout: Layout,
     /// Repos marked in the Repos panel; actions started there run on all of them.
     pub marked: HashSet<PathBuf>,
+    /// Main checkouts whose linked worktrees are listed below them. The others' are hidden.
+    pub expanded: BTreeSet<PathBuf>,
     /// Identifies the multi-repo action whose results popup is showing.
     pub(crate) last_batch: u64,
     /// Where the UI state is saved (`None`: it isn't), and what was saved last.
@@ -403,7 +405,8 @@ impl Workspace {
             }
         });
         let workdir = store.read(cx).workdir.clone();
-        let restore_repo = saved.workdirs.get(&workdir).and_then(|w| w.selected_repo.clone());
+        let saved_workdir = saved.workdirs.get(&workdir).cloned().unwrap_or_default();
+        let restore_repo = saved_workdir.selected_repo;
         let tabs = saved
             .tabs
             .iter()
@@ -464,6 +467,7 @@ impl Workspace {
                 }
             },
             marked: HashSet::new(),
+            expanded: saved_workdir.expanded_repos,
             last_batch: 0,
             state_path,
             last_saved: None,
@@ -543,7 +547,8 @@ impl Workspace {
                 .as_ref()
                 .and_then(|s| s.head.branch_name().map(str::to_string))
                 .unwrap_or_default();
-            return format!("{} {branch}", entry.name());
+            // A worktree by its own name, so filtering for its main checkout doesn't list them all.
+            return format!("{} {branch}", entry.short_name());
         }
         let Some(d) = store.selected_detail() else { return String::new() };
         match view {
@@ -562,6 +567,9 @@ impl Workspace {
 
     /// Indices of the items shown in `view` after filtering.
     pub fn visible(&self, view: View, store: &RepoStore) -> Vec<usize> {
+        if view == View::Repos {
+            return self.listed_repos(store);
+        }
         let count = Self::item_count(view, store);
         match self.filters.get(&view).filter(|f| !f.is_empty()) {
             None => (0..count).collect(),
@@ -572,6 +580,123 @@ impl Workspace {
                     .collect()
             }
         }
+    }
+
+    /// The Repos panel's rows: each main checkout is followed by its worktrees while its
+    /// group is expanded. A filter lists the worktrees it matches, collapsed or not, with
+    /// their main checkout. Only these are acted on; background work covers every repo.
+    fn listed_repos(&self, store: &RepoStore) -> Vec<usize> {
+        let filter = self.repos_filter();
+        let matches = |ix: usize| Self::matches_filter(View::Repos, ix, store, filter.as_deref());
+        let mut rows = Vec::with_capacity(store.repos.len());
+        let mut ix = 0;
+        while ix < store.repos.len() {
+            let worktrees = store.worktrees_of(ix);
+            let next = worktrees.end;
+            let open = filter.is_some() || self.expanded.contains(&store.repos[ix].location.root);
+            let shown: Vec<usize> = worktrees.filter(|&wt| open && matches(wt)).collect();
+            if matches(ix) || !shown.is_empty() {
+                rows.push(ix);
+            }
+            rows.extend(shown);
+            ix = next;
+        }
+        rows
+    }
+
+    /// The Repos panel's filter, lowercased; `None` when there isn't one.
+    fn repos_filter(&self) -> Option<String> {
+        self.filters.get(&View::Repos).filter(|f| !f.is_empty()).map(|f| f.to_lowercase())
+    }
+
+    /// Whether the row at `ix` is one the filter named. True when there's no filter.
+    fn matches_filter(view: View, ix: usize, store: &RepoStore, filter: Option<&str>) -> bool {
+        filter.is_none_or(|f| Self::item_text(view, ix, store).to_lowercase().contains(f))
+    }
+
+    /// Whether the repo at `ix` is one the Repos filter named.
+    pub(crate) fn matches_repo_filter(&self, ix: usize, store: &RepoStore) -> bool {
+        Self::matches_filter(View::Repos, ix, store, self.repos_filter().as_deref())
+    }
+
+    /// Shows or hides worktree groups, keeping the selected repo selected, or its main
+    /// checkout when it's hidden.
+    fn change_groups(&mut self, change: impl FnOnce(&mut BTreeSet<PathBuf>), cx: &mut Context<Self>) {
+        let selected = self.selected_root(cx);
+        change(&mut self.expanded);
+        if let Some(root) = selected {
+            self.select_repo(&root, ScrollStrategy::Nearest, cx);
+        }
+        self.after_change(cx);
+    }
+
+    /// Moves the Repos cursor to `root`, or to its main checkout if it isn't listed.
+    fn select_repo(&mut self, root: &Path, scroll: ScrollStrategy, cx: &App) {
+        let store = self.store.read(cx);
+        let visible = self.visible(View::Repos, store);
+        let position_of = |root: &Path| visible.iter().position(|&ix| store.repos[ix].location.root == root);
+        let main = store.entry(root).and_then(|e| e.main_repo.clone());
+        let Some(position) = position_of(root).or_else(|| main.as_deref().and_then(position_of)) else {
+            return;
+        };
+        let list = self.list(View::Repos);
+        list.selected = position;
+        list.scroll.scroll_to_item(position, scroll);
+    }
+
+    /// `z`: shows or hides the selected repo's worktrees. On a worktree, hides its group
+    /// and selects the main checkout.
+    pub fn toggle_worktrees(&mut self, _: &ToggleWorktrees, _: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let Some(ix) = self.selected_ix(View::Repos, store) else { return };
+        let entry = &store.repos[ix];
+        if let Some(main) = entry.main_repo.clone() {
+            self.change_groups(
+                |expanded| {
+                    expanded.remove(&main);
+                },
+                cx,
+            );
+        } else if !store.worktrees_of(ix).is_empty() {
+            let root = entry.location.root.clone();
+            self.change_groups(
+                |expanded| {
+                    if !expanded.remove(&root) {
+                        expanded.insert(root);
+                    }
+                },
+                cx,
+            );
+        }
+    }
+
+    /// `Z`: shows every repo's worktrees, or hides them all when all are shown.
+    pub fn toggle_all_worktrees(&mut self, _: &ToggleAllWorktrees, _: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let groups: BTreeSet<PathBuf> = (0..store.repos.len())
+            .filter(|&ix| !store.worktrees_of(ix).is_empty())
+            .map(|ix| store.repos[ix].location.root.clone())
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        let expand = !groups.is_subset(&self.expanded);
+        self.change_groups(
+            |expanded| {
+                if expand {
+                    expanded.extend(groups);
+                } else {
+                    expanded.retain(|root| !groups.contains(root));
+                }
+            },
+            cx,
+        );
+    }
+
+    /// A click on a group's `▸`/`▾`: selects the row and toggles its group.
+    pub(crate) fn toggle_group_at(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.click_row(View::Repos, position, Panel::Repos, window, cx);
+        self.toggle_worktrees(&ToggleWorktrees, window, cx);
     }
 
     /// Position in the visible list (clamped).
@@ -643,15 +768,9 @@ impl Workspace {
         let store = self.store.read(cx);
         if !store.scanning {
             self.marked.retain(|root| store.index_of(root).is_some());
-            if let Some(root) = self.restore_repo.take()
-                && let Some(position) = self
-                    .visible(View::Repos, store)
-                    .iter()
-                    .position(|&ix| store.repos[ix].location.root == root)
-            {
-                let list = self.list(View::Repos);
-                list.selected = position;
-                list.scroll.scroll_to_item(position, ScrollStrategy::Center);
+            // A worktree in a collapsed group gives way to its main checkout.
+            if let Some(root) = self.restore_repo.take() {
+                self.select_repo(&root, ScrollStrategy::Center, cx);
             }
         }
         self.follow_staged_file(cx);
@@ -691,7 +810,10 @@ impl Workspace {
                 .filter(|panel| panel.tabs().len() > 1)
                 .map(|panel| (panel, self.tab(panel)))
                 .collect(),
-            workdirs: BTreeMap::from([(workdir, WorkdirState { selected_repo })]),
+            workdirs: BTreeMap::from([(
+                workdir,
+                WorkdirState { selected_repo, expanded_repos: self.expanded.clone() },
+            )]),
             ..UiState::default()
         }
     }
@@ -1614,6 +1736,9 @@ impl Workspace {
 
     pub fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Fetch", window, cx);
+            }
             return self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
         }
         let Some(root) = self.selected_root(cx) else { return };
@@ -1626,12 +1751,22 @@ impl Workspace {
         .detach();
     }
 
-    pub fn fetch_all(&mut self, _: &FetchAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| store.fetch_all(cx));
+    /// `F`: the marked repos, else every listed one. A collapsed worktree shares its main
+    /// checkout's git dir, so fetching that fetches for it too.
+    pub fn fetch_all(&mut self, _: &FetchAll, window: &mut Window, cx: &mut Context<Self>) {
+        let marked = self.marked_targets(cx);
+        if marked.as_ref().is_some_and(|roots| roots.is_empty()) {
+            return self.no_listed_marks("Fetch all", window, cx);
+        }
+        let roots = marked.unwrap_or_else(|| self.listed_targets(cx));
+        self.store.update(cx, |store, cx| store.fetch_many(roots, cx));
     }
 
     pub fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Pull", window, cx);
+            }
             return self.pull_repos(roots, window, cx);
         }
         self.op("Pulling", window, cx, |git, loc| async move { ops::pull(&git, &loc).await });
@@ -1639,6 +1774,9 @@ impl Workspace {
 
     pub fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(roots) = self.marked_targets(cx) {
+            if roots.is_empty() {
+                return self.no_listed_marks("Push", window, cx);
+            }
             return self.push_repos(roots, window, cx);
         }
         let Some(root) = self.selected_root(cx) else { return };

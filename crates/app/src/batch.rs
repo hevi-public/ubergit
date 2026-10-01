@@ -34,27 +34,72 @@ pub struct BatchRow {
 impl Workspace {
     // ---- marks ------------------------------------------------------------------------------
 
-    /// Marked repos in Repos-panel order, when the action starts from the Repos panel.
+    /// Marked repos in Repos-panel order, when the action starts from the Repos panel. Only
+    /// listed ones count: a mark hidden by the filter or a collapsed group isn't acted on.
+    /// Empty when every mark is hidden: the action has to stop there, since falling back to
+    /// the selected repo would act on one the user never marked.
     pub(crate) fn marked_targets(&self, cx: &App) -> Option<Vec<PathBuf>> {
         if self.focused != Panel::Repos || self.marked.is_empty() {
             return None;
         }
+        Some(self.listed_marked(cx))
+    }
+
+    /// Says why an action with marks to act on has nothing to do: they're all out of sight.
+    pub(crate) fn no_listed_marks(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let hidden = self.marked.len();
+        let message = format!(
+            "{hidden} marked {} hidden by the filter or a collapsed group, so there's nothing to act on.\n\n\
+             Clear the filter, press z to show a repo's worktrees, or esc to clear the marks.",
+            if hidden == 1 { "repository is" } else { "repositories are" }
+        );
+        self.show_message(title, message, window, cx);
+    }
+
+    /// Marked repos that are listed, in Repos-panel order.
+    pub(crate) fn listed_marked(&self, cx: &App) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            return Vec::new();
+        }
+        self.listed_roots(cx).into_iter().filter(|root| self.marked.contains(root)).collect()
+    }
+
+    /// Every listed repo, in Repos-panel order: the rows on screen, whether the filter
+    /// named them or they only head a group.
+    pub(crate) fn listed_roots(&self, cx: &App) -> Vec<PathBuf> {
         let store = self.store.read(cx);
-        Some(
-            store
-                .repos
-                .iter()
-                .map(|r| &r.location.root)
-                .filter(|root| self.marked.contains(*root))
-                .cloned()
-                .collect(),
-        )
+        self.visible(View::Repos, store)
+            .into_iter()
+            .map(|ix| store.repos[ix].location.root.clone())
+            .collect()
+    }
+
+    /// The listed repos an action covering "all of them" runs on: those the filter
+    /// matched. A main checkout listed only so its matching worktrees have a header isn't
+    /// one — the filter never named it, and `a`, `F` and `U` would otherwise sweep it in.
+    /// Marking such a row by hand still acts on it: it's visible, so it was deliberate.
+    pub(crate) fn listed_targets(&self, cx: &App) -> Vec<PathBuf> {
+        let store = self.store.read(cx);
+        self.visible(View::Repos, store)
+            .into_iter()
+            .filter(|&ix| self.matches_repo_filter(ix, store))
+            .map(|ix| store.repos[ix].location.root.clone())
+            .collect()
     }
 
     /// Marked repos, else the selected one.
     fn targets(&self, cx: &App) -> Vec<PathBuf> {
         self.marked_targets(cx)
             .unwrap_or_else(|| self.selected_root(cx).into_iter().collect())
+    }
+
+    /// [`Self::targets`], or `None` with a message when every marked repo is hidden.
+    fn action_targets(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<Vec<PathBuf>> {
+        if self.marked_targets(cx).is_some_and(|roots| roots.is_empty()) {
+            self.no_listed_marks(title, window, cx);
+            return None;
+        }
+        Some(self.targets(cx))
     }
 
     /// "billing" or "3 repos", for prompt titles.
@@ -76,12 +121,7 @@ impl Workspace {
 
     /// Marks every listed (filtered) repo, or unmarks them if all are marked already.
     pub fn toggle_mark_all(&mut self, _: &ToggleMarkAll, _: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let listed: Vec<PathBuf> = self
-            .visible(View::Repos, store)
-            .into_iter()
-            .map(|ix| store.repos[ix].location.root.clone())
-            .collect();
+        let listed = self.listed_targets(cx);
         if listed.iter().all(|root| self.marked.contains(root)) {
             for root in &listed {
                 self.marked.remove(root);
@@ -106,7 +146,7 @@ impl Workspace {
     // ---- actions ------------------------------------------------------------------------------
 
     pub fn checkout_by_name(&mut self, _: &CheckoutByName, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("Check out branch", window, cx) else { return };
         if targets.is_empty() {
             return;
         }
@@ -146,7 +186,7 @@ impl Workspace {
     }
 
     pub fn new_branch_in_repos(&mut self, _: &NewBranchInRepos, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("New branch", window, cx) else { return };
         if targets.is_empty() {
             return;
         }
@@ -179,7 +219,7 @@ impl Workspace {
     }
 
     pub fn switch_to_default(&mut self, _: &SwitchToDefault, window: &mut Window, cx: &mut Context<Self>) {
-        let targets = self.targets(cx);
+        let Some(targets) = self.action_targets("Default branch", window, cx) else { return };
         let run = move |this: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
             this.run_batch(
                 "Default branch",
@@ -287,7 +327,8 @@ impl Workspace {
     }
 
     /// `U`: fast-forward repos that are behind their upstream: the marked ones (saying why
-    /// any are skipped), or every repo that can be.
+    /// any are skipped), or every listed one that can be. Repos a filter or a collapsed
+    /// group hides aren't listed, so they aren't touched; the message says how many.
     pub fn fast_forward_all(&mut self, _: &FastForwardAll, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         if let Some((done, total)) = store.fetch_round {
@@ -299,19 +340,36 @@ impl Workspace {
             );
         }
         let marked = self.marked_targets(cx);
+        if marked.as_ref().is_some_and(|roots| roots.is_empty()) {
+            return self.no_listed_marks("Fast-forward", window, cx);
+        }
         let roots = marked.clone().unwrap_or_else(|| {
-            store
-                .repos
-                .iter()
-                .filter(|r| precheck(r).is_ok_and(|s| fast_forward_check(s).is_none()))
-                .map(|r| r.location.root.clone())
+            self.listed_targets(cx)
+                .into_iter()
+                .filter(|root| {
+                    store.entry(root).is_some_and(|r| precheck(r).is_ok_and(|s| fast_forward_check(s).is_none()))
+                })
                 .collect()
         });
         if roots.is_empty() {
+            // Don't claim nothing is behind when the ones that are just aren't on screen.
+            let hidden = store.repos.len() - self.listed_roots(cx).len();
+            let unlisted = match hidden {
+                0 => String::new(),
+                1 => "\n\n1 repository isn't listed, and wasn't looked at. Press Z to show \
+                      worktrees, or clear the filter."
+                    .to_string(),
+                n => format!(
+                    "\n\n{n} repositories aren't listed, and weren't looked at. Press Z to show \
+                     worktrees, or clear the filter."
+                ),
+            };
             return self.show_message(
                 "Fast-forward",
-                "No repos to update: none are on a branch that is behind its upstream and \
-                 free of uncommitted changes.\nFetch first with F.",
+                format!(
+                    "No repos to update: none of the listed ones are on a branch that is behind \
+                     its upstream and free of uncommitted changes.\nFetch first with F.{unlisted}"
+                ),
                 window,
                 cx,
             );

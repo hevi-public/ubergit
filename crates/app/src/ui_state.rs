@@ -1,8 +1,9 @@
 //! UI state kept across restarts, in `~/Library/Application Support/ubergit/state.json`:
 //! panel sizes, window placement, screen mode, focus and tabs, and each workdir's selected
-//! repo. A missing, unreadable or outdated file just means the defaults.
+//! repo and which of its repos show their worktrees. A missing, unreadable or outdated
+//! file just means the defaults.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::ResizableState;
@@ -54,6 +55,8 @@ impl Default for UiState {
 #[serde(default)]
 pub struct WorkdirState {
     pub selected_repo: Option<PathBuf>,
+    /// Main checkouts whose worktrees are shown. Groups start collapsed.
+    pub expanded_repos: BTreeSet<PathBuf>,
 }
 
 /// Panel sizes along each split, in pixels. Only their proportions matter: a split
@@ -243,7 +246,10 @@ mod tests {
             tabs: BTreeMap::from([(Panel::Files, 0), (Panel::Branches, 2), (Panel::Commits, 1)]),
             workdirs: BTreeMap::from([(
                 PathBuf::from("/work/services"),
-                WorkdirState { selected_repo: Some("/work/services/api".into()) },
+                WorkdirState {
+                    selected_repo: Some("/work/services/api".into()),
+                    expanded_repos: BTreeSet::from(["/work/services/api".into()]),
+                },
             )]),
             ..UiState::default()
         }
@@ -283,7 +289,7 @@ mod tests {
         let other = UiState {
             workdirs: BTreeMap::from([(
                 PathBuf::from("/work/web"),
-                WorkdirState { selected_repo: Some("/work/web/site".into()) },
+                WorkdirState { selected_repo: Some("/work/web/site".into()), ..Default::default() },
             )]),
             ..UiState::default()
         };

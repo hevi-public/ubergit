@@ -1,7 +1,7 @@
 //! Live change detection: one recursive FSEvents watch on the workdir, events
 //! routed to repos by path and coalesced per repo.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -50,6 +50,11 @@ pub struct Router {
     prefixes: Vec<(PathBuf, Target)>,
     ignores: Vec<Gitignore>,
     global_ignore: Gitignore,
+    /// Common git dirs of the main checkouts, whose `worktrees/` says when a linked
+    /// worktree is added or removed.
+    common_dirs: HashSet<PathBuf>,
+    /// Git dirs of the linked worktrees being shown.
+    linked_git_dirs: HashSet<PathBuf>,
 }
 
 /// Paths inside a git dir that never affect what we display.
@@ -104,10 +109,23 @@ impl Router {
             prefixes,
             ignores,
             global_ignore: Gitignore::global().0,
+            common_dirs: repos
+                .iter()
+                .filter(|r| !r.bare && !r.is_linked_worktree())
+                .map(|r| r.common_dir.clone())
+                .collect(),
+            linked_git_dirs: repos
+                .iter()
+                .filter(|r| r.is_linked_worktree())
+                .map(|r| r.git_dir.clone())
+                .collect(),
         }
     }
 
     pub fn route(&self, path: &Path) -> Route {
+        if self.is_worktree_added_or_removed(path) {
+            return Route::Rescan;
+        }
         let Some((prefix, target)) = self.prefixes.iter().find(|(p, _)| path.starts_with(p)) else {
             let top_level = path.parent() == Some(self.workdir.as_path());
             let git_marker = path.file_name().is_some_and(|n| n == ".git");
@@ -149,6 +167,17 @@ impl Router {
         }
     }
 
+    /// `git worktree add` and `remove` create and delete `<common dir>/worktrees/<name>`.
+    /// Only a change in whether it exists counts: its known worktree's own events
+    /// shouldn't make a rescan.
+    fn is_worktree_added_or_removed(&self, path: &Path) -> bool {
+        let admin = path.parent().filter(|dir| dir.file_name().is_some_and(|n| n == "worktrees"));
+        let Some(common_dir) = admin.and_then(Path::parent) else {
+            return false;
+        };
+        self.common_dirs.contains(common_dir) && path.is_dir() != self.linked_git_dirs.contains(path)
+    }
+
     fn is_gitignored(&self, ix: usize, rel: &Path) -> bool {
         // Events don't say whether the path was a directory; directory-only
         // patterns like `build/` still match through the parent check.
@@ -183,10 +212,13 @@ pub fn watch(
         let _ = tx.send(event);
     })?;
     watcher.watch(workdir, RecursiveMode::Recursive)?;
-    // Git dirs outside the workdir (e.g. worktrees of a repo elsewhere) need their own watch.
+    // Worktrees and git dirs outside the workdir (a linked worktree elsewhere, or the repo
+    // of one in the workdir) need their own watch.
+    let mut watched = HashSet::new();
     for repo in repos {
-        for dir in [&repo.git_dir, &repo.common_dir] {
-            if !dir.starts_with(workdir) {
+        let root = (!repo.bare).then_some(&repo.root);
+        for dir in root.into_iter().chain([&repo.git_dir, &repo.common_dir]) {
+            if !dir.starts_with(workdir) && watched.insert(dir.clone()) {
                 let _ = watcher.watch(dir, RecursiveMode::Recursive);
             }
         }
@@ -284,5 +316,53 @@ mod tests {
         assert_eq!(r("/w/new-service"), Route::Rescan);
         assert_eq!(r("/w/group/new/.git"), Route::Rescan);
         assert_eq!(r("/w/group/notes.txt"), Route::Ignore);
+    }
+
+    #[test]
+    fn worktrees_inside_a_repo_are_routed_to_themselves() {
+        let repos = vec![
+            repo("/w/a", "/w/a/.git", "/w/a/.git"),
+            repo("/w/a/.claude/worktrees/x", "/w/a/.git/worktrees/x", "/w/a/.git"),
+        ];
+        let router = Router::new(Path::new("/w"), &repos);
+        let r = |p: &str| router.route(Path::new(p));
+        let a = || PathBuf::from("/w/a");
+        let x = || PathBuf::from("/w/a/.claude/worktrees/x");
+
+        // The longest prefix wins: the worktree's files are its own, not its main repo's.
+        assert_eq!(r("/w/a/.claude/worktrees/x/src/main.rs"), Route::Repos(vec![x()]));
+        assert_eq!(r("/w/a/.claude/worktrees/x/node_modules/y.js"), Route::Ignore);
+        assert_eq!(r("/w/a/.claude/settings.json"), Route::Repos(vec![a()]));
+        assert_eq!(r("/w/a/.git/worktrees/x/index"), Route::Repos(vec![x()]));
+        assert_eq!(r("/w/a/.git/refs/heads/feature"), Route::Repos(vec![a(), x()]));
+    }
+
+    #[test]
+    fn adding_or_removing_a_worktree_rescans() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        let common = w.join("a/.git");
+        std::fs::create_dir_all(common.join("worktrees/known")).unwrap();
+        std::fs::create_dir_all(common.join("worktrees/added")).unwrap();
+        let loc = |root: PathBuf, git_dir: PathBuf| RepoLocation {
+            name: String::new(),
+            root,
+            git_dir,
+            common_dir: common.clone(),
+            bare: false,
+        };
+        let repos = vec![
+            loc(w.join("a"), common.clone()),
+            loc(w.join("a/.claude/worktrees/known"), common.join("worktrees/known")),
+            loc(w.join("elsewhere/removed"), common.join("worktrees/removed")),
+        ];
+        let router = Router::new(w, &repos);
+        assert_eq!(router.route(&common.join("worktrees/added")), Route::Rescan);
+        assert_eq!(router.route(&common.join("worktrees/removed")), Route::Rescan);
+        // Still there: an event on the known worktree's git dir is its own.
+        assert_eq!(
+            router.route(&common.join("worktrees/known")),
+            Route::Repos(vec![w.join("a/.claude/worktrees/known")])
+        );
     }
 }

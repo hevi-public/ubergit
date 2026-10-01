@@ -4,11 +4,13 @@
 #
 # Each repo gets its own bare "origin" under <dir>/.origins (hidden, so discovery
 # skips it) and a helper clone under <dir>/.helpers used to push "upstream" work.
+# <dir>-outside (also wiped) holds a worktree that lives outside the workdir.
 set -euo pipefail
 
 DIR=${1:?usage: make-fixtures.sh <dir>}
-rm -rf "$DIR"
-mkdir -p "$DIR/.origins" "$DIR/.helpers"
+rm -rf "$DIR" "$DIR-outside"
+mkdir -p "$DIR/.origins" "$DIR/.helpers" "$DIR-outside"
+OUTSIDE=$(cd "$DIR-outside" && pwd -P)
 DIR=$(cd "$DIR" && pwd -P)
 
 # Isolate from the user's git config (signing, templates, hooks...).
@@ -136,6 +138,14 @@ echo b >> "$DIR/stashed/app.txt"; g -C "$DIR/stashed" stash -q
 # --- main checkout plus a linked worktree next to it
 origin wt; clone wt wt-main
 g -C "$DIR/wt-main" worktree add -q -b wt-branch "$DIR/wt-linked" 2>/dev/null
+
+# --- worktrees the walk doesn't reach, found through `git worktree list`: in a hidden
+# dir as Claude Code makes them, outside the workdir, and one whose directory is gone
+echo ".claude/" >> "$DIR/wt-main/.git/info/exclude"
+g -C "$DIR/wt-main" worktree add -q -b wt-hidden "$DIR/wt-main/.claude/worktrees/wt-hidden" 2>/dev/null
+g -C "$DIR/wt-main" worktree add -q -b wt-away "$OUTSIDE/wt-away" 2>/dev/null
+g -C "$DIR/wt-main" worktree add -q -b wt-pruned "$DIR/wt-pruned" 2>/dev/null
+rm -rf "$DIR/wt-pruned"
 
 # --- repo containing a submodule (the submodule must not be listed separately)
 origin lib; origin with-submodule; clone with-submodule

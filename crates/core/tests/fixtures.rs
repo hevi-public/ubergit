@@ -73,21 +73,49 @@ fn base(name: &str, ahead: u32, behind: u32) -> Option<BaseDivergence> {
 
 #[test]
 fn discovers_every_repo_once() {
-    let names: Vec<&str> = locations().iter().map(|r| r.name.as_str()).collect();
+    let mut names: Vec<&str> = locations().iter().map(|r| r.name.as_str()).collect();
+    names.sort();
     assert_eq!(
         names,
         [
             "ahead", "ambiguous-upstream", "bare-clone.git", "bare-repo.git", "behind",
             "detached", "dirty", "diverged", "feature", "gone", "group/nested-svc", "legacy",
             "local-upstream", "merging", "no-remote", "no-upstream", "pushed-no-upstream",
-            "rebasing", "shallow", "stashed", "synced", "unborn", "with-submodule", "wt-linked",
-            "wt-main",
+            "rebasing", "shallow", "stashed", "synced", "unborn", "with-submodule", "wt-away",
+            "wt-linked", "wt-main", "wt-main/.claude/worktrees/wt-hidden",
         ]
     );
     assert!(repo("bare-repo.git").bare);
     assert!(repo("wt-linked").is_linked_worktree());
     assert_eq!(repo("wt-linked").common_dir, repo("wt-main").git_dir);
     assert!(!repo("wt-main").is_linked_worktree());
+}
+
+#[test]
+fn finds_linked_worktrees_the_walk_misses() {
+    let hidden = repo("wt-main/.claude/worktrees/wt-hidden");
+    assert_eq!(hidden.root, fixtures().join("wt-main/.claude/worktrees/wt-hidden"));
+    assert_eq!(hidden.git_dir, repo("wt-main").git_dir.join("worktrees/wt-hidden"));
+    assert_eq!(hidden.common_dir, repo("wt-main").git_dir);
+    assert_eq!(summary("wt-main/.claude/worktrees/wt-hidden").head, Head::Branch("wt-hidden".into()));
+
+    // Outside the workdir: named by its directory.
+    let away = repo("wt-away");
+    assert!(!away.root.starts_with(fixtures()));
+    assert!(away.is_linked_worktree());
+
+    // The pruned worktree's directory is gone, so it isn't listed.
+    assert!(locations().iter().all(|r| !r.name.contains("wt-pruned")));
+
+    // Each linked worktree belongs to wt-main.
+    let all: Vec<&RepoLocation> = locations().iter().collect();
+    let parents = discovery::main_checkouts(&all);
+    let main_ix = all.iter().position(|r| r.name == "wt-main").unwrap();
+    for (repo, parent) in all.iter().zip(&parents) {
+        let expected = repo.name.starts_with("wt-") && repo.name != "wt-main";
+        assert_eq!(*parent == Some(main_ix), expected, "{}", repo.name);
+        assert!(expected || parent.is_none(), "{}", repo.name);
+    }
 }
 
 #[test]

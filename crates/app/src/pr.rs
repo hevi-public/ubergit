@@ -89,6 +89,42 @@ pub fn badge(view: &PrView) -> Option<Line> {
     Some(line)
 }
 
+/// ` · 2 PR` after a collapsed group: how many of its worktrees have a PR that isn't merged,
+/// coloured by the worst of their checks.
+pub fn group_badge<'a>(views: impl IntoIterator<Item = PrView<'a>>) -> Option<Line> {
+    let mut count = 0;
+    let mut worst: Option<ChecksState> = None;
+    for view in views {
+        let PrView::Found { found, .. } = view else { continue };
+        let Some(pr) = found.lookup.pr.as_ref().filter(|pr| pr.state != PrState::Merged) else {
+            continue;
+        };
+        count += 1;
+        let rank = |state: Option<ChecksState>| match state {
+            Some(ChecksState::Failing) => 3,
+            Some(ChecksState::Pending) => 2,
+            Some(ChecksState::Passing) => 1,
+            None => 0,
+        };
+        let state = pr.checks.as_ref().map(|checks| checks.state);
+        if rank(state) > rank(worst) {
+            worst = state;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let color = match worst {
+        Some(ChecksState::Failing) => Palette::red(),
+        Some(ChecksState::Pending) => Palette::yellow(),
+        Some(ChecksState::Passing) => Palette::green(),
+        None => Palette::cyan(),
+    };
+    let mut line = Line::new();
+    line.color(format!(" · {count} PR"), color);
+    Some(line)
+}
+
 /// The GitHub repo of the remote the checked-out branch's PR would come from, once its URL
 /// has been read: to tell a fork's PR apart, and to name the host that isn't GitHub.
 pub fn remote_repo(entry: &RepoEntry) -> Option<&RemoteRepo> {
@@ -809,5 +845,27 @@ mod tests {
         for gh in [GhStatus::Disabled, GhStatus::NotInstalled, GhStatus::NotLoggedIn, GhStatus::Failed("x".into())] {
             assert!(!column_shown(&gh), "{gh:?}");
         }
+    }
+
+    #[test]
+    fn a_collapsed_group_counts_open_prs_by_their_worst_checks() {
+        let passing = found(Some(pr(PrState::Open, None, Some(ChecksState::Passing))));
+        let pending = found(Some(pr(PrState::Draft, None, Some(ChecksState::Pending))));
+        let failing = found(Some(pr(PrState::Open, None, Some(ChecksState::Failing))));
+        let merged = found(Some(pr(PrState::Merged, None, Some(ChecksState::Failing))));
+        let unchecked = found(Some(pr(PrState::Open, None, None)));
+        let no_pr = found(None);
+        let badge = |founds: &[&Found]| {
+            group_badge(founds.iter().map(|&found| PrView::Found { found, error: None })).map(|line| spans(&line))
+        };
+
+        assert_eq!(badge(&[]), None);
+        // Neither a merged PR nor a branch without one counts.
+        assert_eq!(badge(&[&merged, &no_pr]), None);
+        assert_eq!(badge(&[&unchecked, &no_pr]), Some(vec![span(" · 1 PR", Palette::cyan())]));
+        assert_eq!(badge(&[&passing, &unchecked]), Some(vec![span(" · 2 PR", Palette::green())]));
+        assert_eq!(badge(&[&passing, &pending, &merged]), Some(vec![span(" · 2 PR", Palette::yellow())]));
+        assert_eq!(badge(&[&pending, &failing, &passing]), Some(vec![span(" · 3 PR", Palette::red())]));
+        assert!(group_badge([PrView::Unknown, PrView::Off]).is_none());
     }
 }
