@@ -18,6 +18,9 @@ listing the repos.
            │ [5] Stash               │ Command log
 ```
 
+While the Repos panel is focused, the main view is the overview: open pull requests, not a
+copy of the Repos panel (see [Pull requests](#pull-requests)).
+
 Drag the gaps between panels to resize them: the three columns, the side panels below
 Status, and the main view against the command log.
 
@@ -55,6 +58,10 @@ Options: `--no-fetch` disables background fetching.
   branch, detached, bare, without a remote, or whose remote isn't on a host gh is logged
   in to are never sent to gh. It reads GitHub's API rather than fetching, so
   `--no-fetch` leaves it on; `github_status = false` turns it off.
+- **Open PRs** (the overview): every repo's open PRs, and the review requests, are looked up
+  with the same full rounds and `R`, one lookup at a time. The selected repo's are looked up
+  again when it's selected and they're over a minute old, and a repo's 5 s after a push from
+  the app. The selected PR's reviewers and check names are looked up when it's selected.
 
 Everything goes through the `git` CLI, so your hooks, signing, credential helpers,
 `includeIf` and LFS behave exactly as in a terminal. Background reads use
@@ -69,7 +76,8 @@ lazygit defaults: `h`/`l` or `tab` switch panels, `1`–`5` jump to a panel, `0`
 | Where | Keys |
 |---|---|
 | Anywhere | `⌘R` repos panel (`ctrl-r` works too) · `{`/`}` previous/next repo without leaving the panel · `f` fetch · `p` pull · `P` push (asks before force-with-lease) · `G` open the branch's pull request in the browser (or GitHub's page to open one) · `R` rescan, re-check gh and refresh PR status (no fetch) · `@` toggle command log |
-| Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch the listed repos · `U` fast-forward repos that are behind · `z` show/hide the repo's worktrees · `Z` show/hide all worktrees · `o` open in lazygit |
+| Repos | `enter` open the repo's files · `space` mark · `a` mark all · `c` check out a branch by name · `n` new branch · `m` default branch + fast-forward · `F` fetch the listed repos · `U` fast-forward repos that are behind · `z` show/hide the repo's worktrees · `Z` show/hide all worktrees · `o` open in lazygit · `[`/`]` the overview's tab |
+| Overview (`0` from Repos) | `j`/`k` select a pull request · `G` open it in the browser · `[`/`]` switch tab · `esc` back |
 | Files | `space` stage/unstage · `enter` stage lines · `a` stage all · `c` commit · `A` amend · `d` discard · `s` stash (asks for a message) · `S` stash options |
 | Staging (`enter` on a file) | `space` stage/unstage the selection · `d` discard it (in staged changes: unstage it) · `a` hunk or line selection · `v` range · `shift-↑`/`shift-↓` extend the range · `h`/`l` or `←`/`→` previous/next hunk · `tab` other half · `c` commit · `esc` back |
 | Branches | `space` checkout · `n` new · `d` delete · `f` fast-forward · `-` previous branch · `u` set upstream |
@@ -96,7 +104,7 @@ row, with its branch, upstream, changes and PR, named by its directory; the Stat
 its path. Groups start collapsed: `▸ speech main ✓ +5 wt · 2 PR` counts the worktrees and
 their open PRs, red when some PR's checks fail and yellow while some are running. `z` (or a
 click on `▸`) shows them, `z` on a worktree hides its group again, and `Z` shows or hides
-every group. The overview groups them the same way. A filter lists the worktrees it matches,
+every group. The overview lists a repo's PRs once for all its worktrees. A filter lists the worktrees it matches,
 collapsed or not, with their main checkout.
 
 Status, PR lookups and auto-fetch keep covering hidden worktrees; only actions skip them.
@@ -134,10 +142,9 @@ Each repo shows the pull request for its checked-out branch, found through the
 (`gh auth login`). GitHub Enterprise works for every host gh is logged in to, through gh's own
 hosts (`gh auth login --hostname …`). A branch pushed to a fork finds its PR on the parent repo.
 
-- The overview's `PR` column: `#412 approved ✓`. The word is `draft`, `open`, `approved`,
-  `changes` (requested) or `merged`, and the glyph shows the checks passing `✓`, failing `✗` or
-  still running `●`. `-` means no PR, `…` not looked up yet, and `?` a failed lookup.
-- The Repos panel: `#412✓` after the branch, coloured like the overview's word.
+- The Repos panel: `#412✓` after the branch, coloured by where the PR stands: `draft`,
+  `open`, `approved`, `changes` (requested) or `merged`. The glyph shows the checks passing
+  `✓`, failing `✗` or still running `●`.
 - The Status view (`1`): the title and base branch, who approved, requested changes or was asked
   to review, which checks failed, and when it was last looked up.
 
@@ -148,7 +155,29 @@ against its default branch, as GitHub itself does. It never pushes; `P` does tha
 says why there's nothing to open, or looks the PR up if it isn't known yet. It acts on the
 selected repo only, even with repos marked.
 
-Without gh, or while it isn't logged in, the `PR` column is hidden and the Status view says why.
+### The overview
+
+While the Repos panel is focused, the main view shows open pull requests, teammates' too, in two
+tabs (`[`/`]`):
+
+- **This repo**: the selected repo's open PRs, newest first, under its GitHub name and how many
+  are open. For a fork, the parent's, where the team's PRs are. Worktrees of a repo share it.
+- **Inbox**: every repo's open PRs, grouped: waiting on your review (GitHub's
+  `review-requested:@me`, team requests included, only in the workdir's repos), yours, and
+  teammates'. Each line starts with the repo's name.
+
+Each line reads `#412 approved ✓ Round tax per line  alice  2h  api-fix`: the state, the checks,
+the title, the author, the time since the last update, and the worktree that has the PR's branch
+checked out (`local` when only a local branch has it). Each repo lists its 30 most recently
+updated PRs and says how many more there are.
+
+`0` puts a cursor on the list: `j`/`k` pick a PR, and its reviewers and failing checks show below
+it. `G` opens it in the browser.
+
+A round of 40 repos costs 12 of GitHub's 5,000 points an hour, so ~120 repos every 5 minutes use
+about 450 an hour, beside the branches' lookups' ~600.
+
+Without gh, or while it isn't logged in, the Status view and the overview say why.
 `github_status = false` turns PR status off.
 
 ## Config

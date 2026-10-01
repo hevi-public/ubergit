@@ -32,6 +32,8 @@ pub struct UiState {
     pub last_side: Panel,
     /// Selected tab of each side panel that has more than one.
     pub tabs: BTreeMap<Panel, usize>,
+    /// The overview's tab: the selected repo's PRs, or the inbox.
+    pub overview_tab: usize,
     pub workdirs: BTreeMap<PathBuf, WorkdirState>,
 }
 
@@ -46,6 +48,7 @@ impl Default for UiState {
             focused: Panel::Repos,
             last_side: Panel::Repos,
             tabs: BTreeMap::new(),
+            overview_tab: 0,
             workdirs: BTreeMap::new(),
         }
     }
@@ -244,6 +247,7 @@ mod tests {
             focused: Panel::Main,
             last_side: Panel::Commits,
             tabs: BTreeMap::from([(Panel::Files, 0), (Panel::Branches, 2), (Panel::Commits, 1)]),
+            overview_tab: 1,
             workdirs: BTreeMap::from([(
                 PathBuf::from("/work/services"),
                 WorkdirState {

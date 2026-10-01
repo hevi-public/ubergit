@@ -182,6 +182,17 @@ keymap! {
     "o", "Repos" => OpenInLazygit, "Open in lazygit";
     "z", "Repos" => ToggleWorktrees, "Show / hide the repo's worktrees (on a worktree: hide them)";
     "shift-z", "Repos" => ToggleAllWorktrees, "Show / hide every repo's worktrees";
+    "]", "Repos" => NextTab, "Overview: next tab (this repo's PRs / inbox)";
+    "[", "Repos" => PrevTab, "Overview: previous tab";
+
+    // Overview: the main view on the open PRs (`0` from Repos). The same actions as
+    // anywhere; listed so `?` says what they do here.
+    "j", "Overview" => SelectNext, "Next pull request";
+    "k", "Overview" => SelectPrev, "Previous pull request";
+    "shift-g", "Overview" => OpenPullRequest, "Open the selected pull request in the browser";
+    "]", "Overview" => NextTab, "Next tab (this repo's PRs / inbox)";
+    "[", "Overview" => PrevTab, "Previous tab";
+    "escape", "Overview" => Back, "Back to the repos";
 
     // Files
     "space", "Files" => ToggleStage, "Stage / unstage";

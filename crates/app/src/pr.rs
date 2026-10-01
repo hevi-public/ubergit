@@ -1,6 +1,7 @@
-//! How a repo's pull request reads: the overview's PR column, the badge after the branch in
-//! the Repos panel, and the Status view's rows; and what `G` opens. All of it goes by
-//! [`RepoStore::pr_view`], so another branch's PR never shows, or opens.
+//! How a repo's pull request reads: the badge after the branch in the Repos panel, and the
+//! Status view's rows; and what `G` opens. All of it goes by [`RepoStore::pr_view`], so
+//! another branch's PR never shows, or opens. The overview's lists use the same words and
+//! colours.
 //!
 //! [`RepoStore::pr_view`]: crate::store::RepoStore::pr_view
 
@@ -15,16 +16,15 @@ use crate::store::RepoEntry;
 use crate::text::{Line, age, truncate};
 use crate::theme::Palette;
 
-/// Whether the overview has a PR column. Not while gh can't be asked: every cell would be
-/// blank, and the Status view says why.
-pub fn column_shown(gh: &GhStatus) -> bool {
-    matches!(gh, GhStatus::Unchecked | GhStatus::Ready { .. })
+/// The word for where a PR stands, and its colour.
+fn state_word(pr: &PullRequest) -> (&'static str, Hsla) {
+    word_for(pr.state, pr.review)
 }
 
-/// The word for where a PR stands, and its colour. A draft isn't up for review yet, so it's
-/// a draft whatever the review decision says.
-fn state_word(pr: &PullRequest) -> (&'static str, Hsla) {
-    match (pr.state, pr.review) {
+/// The word for a PR's state and review decision, and its colour. A draft isn't up for
+/// review yet, so it's a draft whatever the review decision says.
+pub fn word_for(state: PrState, review: Option<ReviewDecision>) -> (&'static str, Hsla) {
+    match (state, review) {
         (PrState::Merged, _) => ("merged", Palette::magenta()),
         (PrState::Draft, _) => ("draft", Palette::dim()),
         (PrState::Open, Some(ReviewDecision::Approved)) => ("approved", Palette::green()),
@@ -39,41 +39,26 @@ fn checks_glyph(pr: &PullRequest) -> Option<(&'static str, Hsla)> {
     if pr.state == PrState::Merged {
         return None;
     }
-    Some(match pr.checks.as_ref()?.state {
+    Some(glyph_for(pr.checks.as_ref()?.state))
+}
+
+pub fn glyph_for(state: ChecksState) -> (&'static str, Hsla) {
+    match state {
         ChecksState::Passing => ("✓", Palette::green()),
         ChecksState::Failing => ("✗", Palette::red()),
         ChecksState::Pending => ("●", Palette::yellow()),
-    })
+    }
 }
 
-/// The overview's cell: `#412 approved ✓`, `-` for no PR, `…` until it's known, `?` when
-/// looking it up failed, blank for a branch that can't have one. A failed lookup after an
-/// answer keeps showing the answer; the Status view has the error.
-pub fn cell(view: &PrView) -> Line {
-    let mut line = Line::new();
-    match view {
-        PrView::Found { found, .. } => match &found.lookup.pr {
-            Some(pr) => {
-                let (word, color) = state_word(pr);
-                line.color(format!("#{} {word}", pr.number), color);
-                if let Some((glyph, color)) = checks_glyph(pr) {
-                    line.push(" ");
-                    line.color(glyph, color);
-                }
-            }
-            None => {
-                line.color("-", Palette::dim());
-            }
-        },
-        PrView::Unknown => {
-            line.color("…", Palette::dim());
-        }
-        PrView::Failed(_) => {
-            line.color("?", Palette::red().opacity(0.6));
-        }
-        PrView::Off | PrView::Skipped(_) | PrView::GhNotInstalled | PrView::GhNotLoggedIn | PrView::GhFailed(_) => {}
+/// Why no PR can be looked up for any repo, as one line; `None` while gh can be asked.
+pub fn gh_problem(gh: &GhStatus) -> Option<String> {
+    match gh {
+        GhStatus::Disabled => Some("PR status is turned off (github_status = false in config.toml)".into()),
+        GhStatus::NotInstalled => Some("gh isn't installed (brew install gh)".into()),
+        GhStatus::NotLoggedIn => Some("gh isn't logged in: run gh auth login".into()),
+        GhStatus::Failed(message) => Some(message.lines().next().unwrap_or_default().to_string()),
+        GhStatus::Unchecked | GhStatus::Ready { .. } => None,
     }
-    line
 }
 
 /// ` #412✓` after the branch in the Repos panel, coloured like the overview's word. Only for
@@ -182,8 +167,8 @@ pub fn status_rows(
         }
         PrView::Unknown => "looking up…".to_string(),
         PrView::Skipped(skip) => skip_reason(*skip, remote),
-        PrView::GhNotInstalled => "gh isn't installed (brew install gh)".to_string(),
-        PrView::GhNotLoggedIn => "gh isn't logged in: run gh auth login".to_string(),
+        PrView::GhNotInstalled => gh_problem(&GhStatus::NotInstalled).unwrap_or_default(),
+        PrView::GhNotLoggedIn => gh_problem(&GhStatus::NotLoggedIn).unwrap_or_default(),
         PrView::GhFailed(message) => message.lines().next().unwrap_or_default().to_string(),
     };
     let mut line = Line::new();
@@ -281,7 +266,7 @@ fn create_url<'a>(found: &'a Found, summary: Option<&RepoSummary>) -> Option<&'a
 
 /// Opens only `https://` URLs. A PR's comes from GitHub's answer, and macOS would hand any
 /// other scheme to whatever app claims it.
-fn open_https(url: &str) -> OpenAction {
+pub fn open_https(url: &str) -> OpenAction {
     if url.starts_with("https://") {
         OpenAction::Open(url.to_string())
     } else {
@@ -347,7 +332,7 @@ fn base_label(pr: &PullRequest, remote: Option<&RemoteRepo>) -> String {
 
 /// `alice ✓  bob ✗  platform-team (requested)`, as many as fit in `width`. Those who have
 /// reviewed come first: when some must be left out, it's better they're the ones asked.
-fn reviews(reviewers: &[Reviewer], width: usize) -> Line {
+pub fn reviews(reviewers: &[Reviewer], width: usize) -> Line {
     let mark = |state: ReviewerState| match state {
         ReviewerState::Approved => (" ✓", Palette::green()),
         ReviewerState::ChangesRequested => (" ✗", Palette::red()),
@@ -377,7 +362,7 @@ fn reviews(reviewers: &[Reviewer], width: usize) -> Line {
 
 /// `2 failing: build, e2e`, `pending: 3 of 14` or `passing (14)`. Failing checks with
 /// others still running say so, since more may fail.
-fn checks_line(checks: &Checks, width: usize) -> Line {
+pub fn checks_line(checks: &Checks, width: usize) -> Line {
     let mut line = Line::new();
     match checks.state {
         ChecksState::Failing => {
@@ -440,10 +425,15 @@ fn fitting(widths: &[usize], sep: usize, width: usize) -> usize {
 
 /// `failed 1m ago: <message>` in red, after what the line says already.
 fn failure(line: &mut Line, error: &LookupError, width: usize) {
+    failed_at(line, &error.message, error.at, width);
+}
+
+/// `failed 1m ago: <message>` in red, the message's first line cut to fit in `width`.
+pub fn failed_at(line: &mut Line, message: &str, at: std::time::SystemTime, width: usize) {
     let gap = if line.width() > 0 { "  " } else { "" };
-    let head = format!("{gap}failed {} ago: ", age(Some(error.at)));
+    let head = format!("{gap}failed {} ago: ", age(Some(at)));
     let room = width.saturating_sub(line.width() + head.chars().count()).max(20);
-    let message = error.message.lines().next().unwrap_or_default();
+    let message = message.lines().next().unwrap_or_default();
     line.color(format!("{head}{}", truncate(message, room)), Palette::red());
 }
 
@@ -516,50 +506,30 @@ mod tests {
         line.spans().into_iter().map(|(text, _)| text).collect()
     }
 
-    fn cell_of(pr: PullRequest) -> Vec<(String, Option<Hsla>)> {
-        let found = found(Some(pr));
-        spans(&cell(&PrView::Found { found: &found, error: None }))
-    }
-
     fn span(text: &str, color: Hsla) -> (String, Option<Hsla>) {
         (text.to_string(), Some(color))
     }
 
     #[test]
-    fn the_cell_names_the_state_then_the_checks() {
+    fn the_word_names_the_state_and_the_glyph_the_checks() {
         let cases = [
-            (pr(PrState::Open, Some(ReviewDecision::Approved), Some(ChecksState::Passing)), "#412 approved", Palette::green()),
-            (pr(PrState::Open, Some(ReviewDecision::ChangesRequested), Some(ChecksState::Passing)), "#412 changes", Palette::red()),
-            (pr(PrState::Open, Some(ReviewDecision::ReviewRequired), Some(ChecksState::Passing)), "#412 open", Palette::cyan()),
-            (pr(PrState::Open, None, Some(ChecksState::Passing)), "#412 open", Palette::cyan()),
+            (PrState::Open, Some(ReviewDecision::Approved), "approved", Palette::green()),
+            (PrState::Open, Some(ReviewDecision::ChangesRequested), "changes", Palette::red()),
+            (PrState::Open, Some(ReviewDecision::ReviewRequired), "open", Palette::cyan()),
+            (PrState::Open, None, "open", Palette::cyan()),
             // A draft is a draft, even approved.
-            (pr(PrState::Draft, Some(ReviewDecision::Approved), Some(ChecksState::Passing)), "#412 draft", Palette::dim()),
+            (PrState::Draft, Some(ReviewDecision::Approved), "draft", Palette::dim()),
+            (PrState::Merged, Some(ReviewDecision::Approved), "merged", Palette::magenta()),
         ];
-        for (pr, word, color) in cases {
-            assert_eq!(cell_of(pr), [span(word, color), (" ".into(), None), span("✓", Palette::green())], "{word}");
+        for (state, review, word, color) in cases {
+            assert_eq!(word_for(state, review), (word, color), "{word}");
         }
-        let with_checks = |checks| cell_of(pr(PrState::Open, None, checks));
-        assert_eq!(with_checks(Some(ChecksState::Failing))[2], span("✗", Palette::red()));
-        assert_eq!(with_checks(Some(ChecksState::Pending))[2], span("●", Palette::yellow()));
-        assert_eq!(with_checks(None), [span("#412 open", Palette::cyan())]);
+        assert_eq!(glyph_for(ChecksState::Passing), ("✓", Palette::green()));
+        assert_eq!(glyph_for(ChecksState::Failing), ("✗", Palette::red()));
+        assert_eq!(glyph_for(ChecksState::Pending), ("●", Palette::yellow()));
         // Checks don't matter once it's merged.
-        let merged = pr(PrState::Merged, Some(ReviewDecision::Approved), Some(ChecksState::Failing));
-        assert_eq!(cell_of(merged), [span("#412 merged", Palette::magenta())]);
-    }
-
-    #[test]
-    fn the_cell_says_when_there_is_no_pr_to_show() {
-        let none = found(None);
-        let failed = error("timed out");
-        let cell_text = |view: PrView| text(&cell(&view));
-        assert_eq!(cell_text(PrView::Found { found: &none, error: None }), "-");
-        // A later failure keeps the answer.
-        let open = found(Some(pr(PrState::Open, None, None)));
-        assert_eq!(cell_text(PrView::Found { found: &open, error: Some(&failed) }), "#412 open");
-        assert_eq!(cell_text(PrView::Unknown), "…");
-        assert_eq!(spans(&cell(&PrView::Failed(&failed))), [span("?", Palette::red().opacity(0.6))]);
-        assert_eq!(cell_text(PrView::Skipped(Skip::DefaultBranch)), "");
-        assert_eq!(cell_text(PrView::Off), "");
+        assert_eq!(checks_glyph(&pr(PrState::Merged, None, Some(ChecksState::Failing))), None);
+        assert_eq!(checks_glyph(&pr(PrState::Open, None, None)), None);
     }
 
     #[test]
@@ -839,12 +809,13 @@ mod tests {
     }
 
     #[test]
-    fn the_column_hides_when_gh_cannot_answer() {
-        assert!(column_shown(&GhStatus::Unchecked));
-        assert!(column_shown(&GhStatus::Ready { hosts: vec!["github.com".into()] }));
-        for gh in [GhStatus::Disabled, GhStatus::NotInstalled, GhStatus::NotLoggedIn, GhStatus::Failed("x".into())] {
-            assert!(!column_shown(&gh), "{gh:?}");
-        }
+    fn gh_problems_read_as_one_line() {
+        assert_eq!(gh_problem(&GhStatus::Unchecked), None);
+        assert_eq!(gh_problem(&GhStatus::Ready { hosts: vec!["github.com".into()] }), None);
+        assert_eq!(gh_problem(&GhStatus::NotInstalled).as_deref(), Some("gh isn't installed (brew install gh)"));
+        assert_eq!(gh_problem(&GhStatus::NotLoggedIn).as_deref(), Some("gh isn't logged in: run gh auth login"));
+        assert_eq!(gh_problem(&GhStatus::Failed("timed out\nmore".into())).as_deref(), Some("timed out"));
+        assert!(gh_problem(&GhStatus::Disabled).is_some());
     }
 
     #[test]
